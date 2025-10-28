@@ -6,10 +6,12 @@ name: mineworld_frames
 data_root: data/mineworld_split/train
 
 context_frames: 8
-frame_skip: 1
-resolution: 256
-action_classes: 4
+#frame_skip: 1
+#resolution: 256
+#action_classes: 4
 resize: 256
 recursive: true
 val_fraction: 0.1
 seed: 0
+
+#action_classes and action_keys directly pulled from mcdataset.py
