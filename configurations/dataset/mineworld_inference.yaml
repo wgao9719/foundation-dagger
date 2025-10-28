@@ -1,0 +1,9 @@
+defaults:
+  - _self_
+
+name: mineworld_inference
+# Directory containing source MineWorld videos (.mp4) and paired action logs (.jsonl).
+data_root: data/mineworld/validation
+video_glob: "*.mp4"
+recursive: false
+action_extension: ".jsonl"

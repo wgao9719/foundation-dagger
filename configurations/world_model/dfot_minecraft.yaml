@@ -1,0 +1,17 @@
+defaults:
+  - /algorithm/dfot_video
+  - _self_
+
+# inference-friendly overrides
+compile: False
+tasks:
+  prediction:
+    enabled: True
+    history_guidance:
+      name: conditional
+    keyframe_density: 1.0
+    sliding_context_len: 24
+  interpolation:
+    enabled: False
+vae:
+  pretrained_path: pretrained:ImageVAE_MCRAFT.ckpt

@@ -1,0 +1,109 @@
+# Project-specific
+notes.txt
+outputs/
+wandb/
+checkpoints/
+!checkpoints/vae/config.json
+data/
+minimal/
+huggingface/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+
+# PyTorch / ML
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDEs / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Hydra
+.hydra/
+multirun/
+
+# Weights & Biases
+wandb/
+*.wandb
+
+# Data and media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+!teaser.png
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+*.secret
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+.directory
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+tmp/
+temp/

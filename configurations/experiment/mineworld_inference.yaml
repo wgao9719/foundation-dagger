@@ -1,0 +1,20 @@
+defaults:
+  - _self_
+
+tasks:
+  - generate
+
+generation:
+  output_dir: outputs/mineworld
+  context_frames: 8
+  num_frames: 16
+  fps: 6
+  accelerate_algo: naive
+  window_size: 4
+  sampler:
+    temperature: 1.0
+    top_p: 0.8
+    top_k: null
+  limit: null
+  overwrite: false
+  copy_actions: true

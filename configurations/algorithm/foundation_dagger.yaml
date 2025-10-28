@@ -1,0 +1,17 @@
+# Lightning module for BC + DAgger fine-tuning.
+
+policy:
+  backbone: resnet50
+  pretrained_backbone: false
+  backbone_trainable: true
+  backbone_dim: null
+  hidden_dim: 512
+  action_dim: ${dataset.external_cond_dim}
+  head_layers: 4
+  dropout: 0.0
+  activation: gelu
+
+optim:
+  lr: 3e-4
+  weight_decay: 1e-4
+  warmup_steps: 100

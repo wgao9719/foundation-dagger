@@ -1,0 +1,44 @@
+defaults:
+  - base_pytorch_exp
+  - _self_
+
+tasks:
+  - collect
+  - training
+  - validation
+
+training:
+  batch_size: 64
+  max_epochs: 50
+  data:
+    num_workers: 4
+validation:
+  batch_size: 64
+  data:
+    num_workers: 4
+
+collector:
+  dataset: configurations/dataset/minecraft.yaml
+  world_model:
+    checkpoint: pretrained:DFoT_MCRAFT.ckpt
+    algorithm: configurations/world_model/dfot_minecraft.yaml
+    device: cuda
+  planner:
+    horizon: 8
+    num_candidates: 64
+    elite_frac: 0.25
+    iterations: 4
+  vlm:
+    model_id: null
+    good_prompts:
+      - "successful Minecraft navigation"
+    bad_prompts:
+      - "failure"
+  runner:
+    output_dir: data/dagger
+    batch_size: 4
+    max_episodes: 64
+    context_frames: 8
+    horizon: 8
+    policy_checkpoint: null
+    overwrite: True

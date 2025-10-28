@@ -1,0 +1,10 @@
+defaults:
+  - _self_
+
+store:
+  save_dir: data/dagger
+  split: training
+  in_memory: true
+  metadata_name: manifest.json
+
+action_dim: 4
