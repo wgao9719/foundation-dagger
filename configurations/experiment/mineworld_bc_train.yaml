@@ -6,7 +6,7 @@ training:
   epochs: 5
   val_fraction: 0.1
   seed: 0
-  checkpoint_interval: 2  
+  checkpoint_interval: 2  # Set >0 to save model state every N epochs
 
 optimizer:
   lr: 3e-4

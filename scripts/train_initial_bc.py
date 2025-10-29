@@ -305,10 +305,7 @@ def train_initial_bc(
         pin_memory=True,
     )
 
-    global_step = 0
-
     def run_epoch(data_loader, train: bool):
-        nonlocal global_step
         running_loss = 0.0
         running_acc = 0.0
         count = 0
@@ -327,10 +324,6 @@ def train_initial_bc(
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
-                    global_step += 1
-                    if checkpoint_interval > 0 and global_step % checkpoint_interval == 0:
-                        ckpt_path = save_checkpoint(f"step{global_step:06d}")
-                        print(f"Saved checkpoint to {ckpt_path}")
             running_loss += loss.item() * observations.size(0)
             preds = logits.argmax(dim=-1)
             token_acc = (preds == labels).float().mean(dim=1)
@@ -360,6 +353,9 @@ def train_initial_bc(
             print(
                 f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f}"
             )
+        if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
+            ckpt_path = save_checkpoint(f"epoch{epoch + 1:03d}")
+            print(f"Saved checkpoint to {ckpt_path}")
 
     final_path = save_checkpoint(None)
     wandb.finish()
