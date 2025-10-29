@@ -9,7 +9,3 @@ policy:
   activation: gelu
   action_dim: ${dataset.external_cond_dim}
 
-# optim:
-#   lr: 3e-4
-#   weight_decay: 1e-4
-#   warmup_steps: 0

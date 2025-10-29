@@ -6,6 +6,7 @@ training:
   epochs: 5
   val_fraction: 0.1
   seed: 0
+  checkpoint_interval: 2  
 
 optimizer:
   lr: 3e-4

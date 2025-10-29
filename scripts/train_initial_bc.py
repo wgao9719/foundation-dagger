@@ -12,9 +12,9 @@ Example
 -------
 python scripts/train_initial_bc.py \
     --dataset mineworld_frames \
-    --data-root /Users/willi1/foundation-dagger/diffusion-forcing-transformer/data/mineworld_split/val \
+    --data-root /Users/willi1/foundation-dagger/diffusion-forcing-transformer/data/mineworld \
     --fraction 0.1 \
-    --epochs 5 \
+    --epochs 10 \
     --batch-size 32 \
     --output checkpoints/bc_policy.ckpt
 """
@@ -40,13 +40,13 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 import wandb
 
-from datasets.mineworld_data.mcdataset import MCDataset
-
-import cv2 
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+from datasets.mineworld_data.mcdataset import MCDataset
+
+import cv2 
 
 CONFIG_DIR = ROOT_DIR / "configurations"
 
@@ -132,7 +132,7 @@ class MineWorldFrameDataset(Dataset):
         if not video_paths:
             raise FileNotFoundError(
                 f"No .mp4 files found under {self.data_root}. "
-                "Pass the MineWorld validation directory via --data-root."
+                "Pass the MineWorld data directory via --data-root."
             )
 
         for video_path in video_paths:
@@ -245,6 +245,7 @@ def train_initial_bc(
     train_workers = int(train_cfg.get("num_workers", 4))
     val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
+    checkpoint_interval = int(train_cfg.get("checkpoint_interval", 0))
 
     wandb.init(
         project="foundation-dagger",
@@ -279,6 +280,16 @@ def train_initial_bc(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
+    def save_checkpoint(suffix: str | None = None) -> Path:
+        if suffix:
+            checkpoint_path = output.with_name(f"{output.stem}_{suffix}{output.suffix}")
+        else:
+            checkpoint_path = output
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), checkpoint_path)
+        wandb.save(str(checkpoint_path))
+        return checkpoint_path
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(opt_cfg.get("lr", 3e-4)),
@@ -294,7 +305,10 @@ def train_initial_bc(
         pin_memory=True,
     )
 
+    global_step = 0
+
     def run_epoch(data_loader, train: bool):
+        nonlocal global_step
         running_loss = 0.0
         running_acc = 0.0
         count = 0
@@ -313,6 +327,10 @@ def train_initial_bc(
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+                    global_step += 1
+                    if checkpoint_interval > 0 and global_step % checkpoint_interval == 0:
+                        ckpt_path = save_checkpoint(f"step{global_step:06d}")
+                        print(f"Saved checkpoint to {ckpt_path}")
             running_loss += loss.item() * observations.size(0)
             preds = logits.argmax(dim=-1)
             token_acc = (preds == labels).float().mean(dim=1)
@@ -343,11 +361,9 @@ def train_initial_bc(
                 f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f}"
             )
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), output)
-    wandb.save(str(output))
+    final_path = save_checkpoint(None)
     wandb.finish()
-    print(f"Saved checkpoint to {output}")
+    print(f"Saved checkpoint to {final_path}")
 
 
 def parse_args() -> argparse.Namespace:
