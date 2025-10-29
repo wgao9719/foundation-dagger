@@ -1,0 +1,15 @@
+policy:
+  backbone: resnet50
+  pretrained_backbone: true
+  backbone_trainable: true
+  backbone_dim: null
+  hidden_dim: 512
+  head_layers: 4
+  dropout: 0.1
+  activation: gelu
+  action_dim: ${dataset.external_cond_dim}
+
+# optim:
+#   lr: 3e-4
+#   weight_decay: 1e-4
+#   warmup_steps: 0

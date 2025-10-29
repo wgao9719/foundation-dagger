@@ -10,8 +10,13 @@ to keep the bootstrap stage quick.
 
 Example
 -------
-python experiments/train_initial_bc.py --data-root /Users/willi1/foundation-dagger/diffusion-forcing-transformer/data/mineworld_split/val\\
-    --fraction 0.1 --epochs 5 --output checkpoints/bc_policy.ckpt
+python scripts/train_initial_bc.py \
+    --dataset mineworld_frames \
+    --data-root /Users/willi1/foundation-dagger/diffusion-forcing-transformer/data/mineworld_split/val \
+    --fraction 0.1 \
+    --epochs 5 \
+    --batch-size 32 \
+    --output checkpoints/bc_policy.ckpt
 """
 
 
@@ -28,7 +33,6 @@ from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
 from typing import Dict, List, Tuple
 
-import cv2
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -37,6 +41,8 @@ from torchvision.transforms import InterpolationMode
 import wandb
 
 from datasets.mineworld_data.mcdataset import MCDataset
+
+import cv2 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -48,6 +54,42 @@ from algorithms.foundation_dagger.policy import FoundationBCPolicy, PolicyConfig
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def _load_hydra_configs(
+    dataset_name: str = "mineworld_frames",
+    algorithm_name: str = "mineworld_bc",
+    experiment_name: str = "mineworld_bc_train"
+) -> tuple[dict, dict, dict]:
+    overrides: list[str] = []
+    if dataset_name:
+        overrides.append(f"dataset={dataset_name}")
+    if algorithm_name:
+        overrides.append(f"algorithm={algorithm_name}")
+    if experiment_name:
+        overrides.append(f"experiment={experiment_name}")
+
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
+        cfg = compose(config_name="config", overrides=overrides)
+
+    dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
+    policy_cfg = OmegaConf.to_container(cfg.algorithm.policy, resolve=True)
+    exp_cfg = OmegaConf.to_container(cfg.experiment, resolve=True)
+    return dataset_cfg, policy_cfg, exp_cfg
+
+def _load_actions(json_path: Path) -> List[Dict]:
+    if not json_path.exists():
+        raise FileNotFoundError(f"Missing action log for {json_path}")
+    actions: List[Dict] = []
+    with json_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            actions.append(json.loads(line))
+    return actions
 
 
 class MineWorldFrameDataset(Dataset):
@@ -83,6 +125,7 @@ class MineWorldFrameDataset(Dataset):
             ]
         )
         self._build_index(recursive=recursive)
+
     def _build_index(self, recursive: bool) -> None:
         pattern = "**/*.mp4" if recursive else "*.mp4"
         video_paths = sorted(self.data_root.glob(pattern))
@@ -154,6 +197,7 @@ def train_initial_bc(
     dataset_cfg: Dict,
     policy_cfg_dict: Dict,
     dataset_name: str,
+    exp_cfg: Dict,
 ) -> None:
     policy_cfg = PolicyConfig(**policy_cfg_dict)
     action_keys_cfg = dataset_cfg.get("action_keys")
@@ -175,23 +219,32 @@ def train_initial_bc(
     action_vocab_size = dataset.action_vocab_size
     policy_cfg.action_dim = action_vocab_size * action_length
 
+    train_cfg = exp_cfg.get("training", {})
+    opt_cfg = exp_cfg.get("optimizer", {})
+
     subset_len = max(1, int(len(dataset) * fraction))
     indices = list(range(len(dataset)))
-    random_seed = int(dataset_cfg.get("seed", 0))
+    random_seed = int(train_cfg.get("seed", dataset_cfg.get("seed", 0)))
     random.seed(random_seed)
     random.shuffle(indices)
-    if subset_len <= 1:
+    val_fraction = float(train_cfg.get("val_fraction", dataset_cfg.get("val_fraction", 0.1)))
+    if subset_len <= 1 or val_fraction <= 0:
         val_fraction = 0.0
         val_split = 0
     else:
-        val_fraction = float(dataset_cfg.get("val_fraction", 0.1))
         val_split = max(1, int(round(subset_len * val_fraction)))
         if val_split >= subset_len:
-            val_split = subset_len - 1
+            val_split = max(1, subset_len - 1)
     val_indices = indices[:val_split]
     train_indices = indices[val_split:subset_len]
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
+
+    train_batch_size = int(train_cfg.get("batch_size", batch_size))
+    train_epochs = int(train_cfg.get("epochs", epochs))
+    train_workers = int(train_cfg.get("num_workers", 4))
+    val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
+    val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
 
     wandb.init(
         project="foundation-dagger",
@@ -200,8 +253,8 @@ def train_initial_bc(
             "dataset": dataset_name,
             "data_root": str(data_root),
             "fraction": fraction,
-            "epochs": epochs,
-            "batch_size": batch_size,
+            "epochs": train_epochs,
+            "batch_size": train_batch_size,
             "context_frames": context_frames,
             "resize": resize,
             "val_fraction": val_fraction,
@@ -209,7 +262,6 @@ def train_initial_bc(
             "action_vocab_size": action_vocab_size,
             "action_length": action_length,
             "policy_output_dim": policy_cfg.action_dim,
-            "action_keys": len(action_keys_cfg) if action_keys_cfg else None,
             "train_samples": len(train_subset),
             "val_samples": len(val_subset),
         },
@@ -217,9 +269,9 @@ def train_initial_bc(
 
     loader = DataLoader(
         train_subset,
-        batch_size=batch_size,
+        batch_size=train_batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=train_workers,
         pin_memory=True,
     )
 
@@ -227,11 +279,19 @@ def train_initial_bc(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(opt_cfg.get("lr", 3e-4)),
+        betas=tuple(opt_cfg.get("betas", [0.9, 0.99])),
+        weight_decay=float(opt_cfg.get("weight_decay", 1e-4)),
+    )
     criterion = nn.CrossEntropyLoss()
 
     val_loader = DataLoader(
-        val_subset, batch_size=batch_size, num_workers=2, pin_memory=True
+        val_subset,
+        batch_size=val_batch_size,
+        num_workers=val_workers,
+        pin_memory=True,
     )
 
     def run_epoch(data_loader, train: bool):
@@ -262,7 +322,7 @@ def train_initial_bc(
             return 0.0, 0.0
         return running_loss / count, running_acc / count
 
-    for epoch in range(epochs):
+    for epoch in range(train_epochs):
         train_loss, train_acc = run_epoch(loader, train=True)
         if len(val_subset) > 0:
             val_loss, val_acc = run_epoch(val_loader, train=False)
@@ -335,7 +395,9 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    dataset_cfg, policy_cfg_dict = _load_hydra_configs(dataset_name=args.dataset)
+    dataset_cfg, policy_cfg_dict, exp_cfg = _load_hydra_configs(
+        dataset_name=args.dataset, algorithm_name='mineworld_bc', experiment_name='mineworld_bc_train'
+    )
     dataset_name = args.dataset or dataset_cfg.get("name", "mineworld_frames")
 
     data_root_value = args.data_root or dataset_cfg.get("data_root")
@@ -371,4 +433,5 @@ if __name__ == "__main__":
         dataset_cfg=dataset_cfg,
         policy_cfg_dict=policy_cfg_dict,
         dataset_name=dataset_name,
+        exp_cfg=exp_cfg,
     )

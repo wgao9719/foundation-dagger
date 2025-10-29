@@ -1,0 +1,13 @@
+defaults:
+  - _self_
+
+training:
+  batch_size: 32
+  epochs: 5
+  val_fraction: 0.1
+  seed: 0
+
+optimizer:
+  lr: 3e-4
+  weight_decay: 1e-4
+  betas: [0.9, 0.99]
