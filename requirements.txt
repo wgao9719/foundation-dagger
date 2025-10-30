@@ -34,3 +34,4 @@ zmq
 pytubefix
 roma
 transformers
+minerl

@@ -17,3 +17,5 @@ resize: 256
 recursive: true
 val_fraction: 0.1
 seed: 0
+
+output: checkpoints/bc_policy.ckpt

@@ -227,7 +227,8 @@ def train_initial_bc(
     random_seed = int(train_cfg.get("seed", dataset_cfg.get("seed", 0)))
     random.seed(random_seed)
     random.shuffle(indices)
-    val_fraction = float(train_cfg.get("val_fraction", dataset_cfg.get("val_fraction", 0.1)))
+
+    val_fraction = fraction
     if subset_len <= 1 or val_fraction <= 0:
         val_fraction = 0.0
         val_split = 0
@@ -240,8 +241,9 @@ def train_initial_bc(
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
 
-    train_batch_size = int(train_cfg.get("batch_size", batch_size))
-    train_epochs = int(train_cfg.get("epochs", epochs))
+    train_batch_size = batch_size
+    train_epochs = epochs
+        
     train_workers = int(train_cfg.get("num_workers", 4))
     val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
@@ -376,9 +378,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory containing MineWorld .mp4 videos and matching .jsonl logs. Overrides config if provided.",
     )
-    parser.add_argument("--fraction", type=float, default=1.0 / 6, help="Dataset fraction to use")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="Training batch size")
+    parser.add_argument(
+        "--fraction", 
+        type=float, 
+        default=1.0 / 6, 
+        help="Dataset fraction to use"
+    )
+    parser.add_argument(
+        "--epochs", 
+        type=int, 
+        default=5, 
+        help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--batch-size", 
+        type=int, 
+        default=32, 
+        help="Training batch size"
+    )
     parser.add_argument(
         "--context-frames",
         type=int,
@@ -419,6 +436,21 @@ if __name__ == "__main__":
                  if Path(data_root_value).is_absolute()
                  else (ROOT_DIR / data_root_value).resolve())
 
+    if args.fraction is not None:
+        fraction = args.fraction
+    else:
+        fraction = float(dataset_cfg.get("fraction", 0.1))
+
+    if args.epochs is not None:
+        epochs = args.epochs
+    else:
+        epochs = int(dataset_cfg.get("epochs", 5))
+
+    if args.batch_size is not None:
+        batch_size = args.batch_size
+    else:
+        batch_size = int(dataset_cfg.get("batch_size", 32))
+
     if args.context_frames is not None:
         context_frames = args.context_frames
     else:
@@ -429,19 +461,24 @@ if __name__ == "__main__":
     else:
         resize = int(dataset_cfg.get("resize", dataset_cfg.get("resolution", 256)))
 
+    if args.output is not None:
+        output = args.output
+    else:
+        output = dataset_cfg.get("output", "checkpoints/bc_policy.ckpt")
+
     recursive = dataset_cfg.get("recursive", True)
     if args.no_recursive:
         recursive = False
 
     train_initial_bc(
         data_root=data_root,
-        fraction=args.fraction,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
+        fraction=fraction,
+        epochs=epochs,
+        batch_size=batch_size,
         context_frames=context_frames,
         recursive=recursive,
         resize=resize,
-        output=args.output,
+        output=output,
         dataset_cfg=dataset_cfg,
         policy_cfg_dict=policy_cfg_dict,
         dataset_name=dataset_name,
