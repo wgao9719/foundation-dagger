@@ -79,6 +79,7 @@ class ProcessedMineWorldDataset(Dataset):
         self.action_length = int(metadata["action_length"])
         self.action_vocab_size = int(metadata["action_vocab_size"])
         self.total_samples = int(metadata["num_samples"])
+        self.frame_dtype = str(metadata.get("frame_dtype", "float32"))
 
         self.chunks = metadata.get("chunks", [])
         if not self.chunks:
@@ -121,7 +122,11 @@ class ProcessedMineWorldDataset(Dataset):
         if not chunk_path.exists():
             raise FileNotFoundError(f"Missing processed chunk file at {chunk_path}")
         data = torch.load(chunk_path, map_location="cpu")
-        frames = data["frames"].float()
+        frames = data["frames"]
+        if self.frame_dtype == "float16" and frames.dtype != torch.float32:
+            frames = frames.to(torch.float32)
+        else:
+            frames = frames.float()
         labels = data["labels"].long()
         self._chunk_cache[chunk_idx] = (frames, labels)
         self._chunk_order.append(chunk_idx)

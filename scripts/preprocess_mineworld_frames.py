@@ -1,18 +1,17 @@
 """Decode MineWorld rollouts into preprocessed tensors for fast BC training.
 
-This script walks the raw MineWorld dataset, converts each usable frame to a
-normalised tensor, computes the corresponding action token targets, and writes
-sharded `.pt` chunks alongside metadata. The resulting directory can be fed
-directly into `train_initial_bc.py` to avoid per-epoch video decoding.
+This preprocessing stage converts MineWorld videos + action logs into sharded
+PyTorch tensors so the BC trainer can stream batches without hitting OpenCV.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -57,8 +56,8 @@ def _load_hydra_configs(
     return dataset_cfg, policy_cfg, exp_cfg
 
 
-class MineWorldFrameExtractor:
-    """Sequential iterator over MineWorld trajectories with preprocessing."""
+class MineWorldFrameSummary:
+    """Utility class to collect MineWorld metadata and length estimates."""
 
     def __init__(
         self,
@@ -72,13 +71,11 @@ class MineWorldFrameExtractor:
         self.resize = resize
         self.recursive = recursive
 
-        self.mc_dataset = MCDataset()
-        self.mc_dataset.make_action_vocab(action_vocab_offset=0)
-        self.action_length = self.mc_dataset.action_length
-        self.action_vocab_size = len(self.mc_dataset.action_vocab)
+        dataset = MCDataset()
+        dataset.make_action_vocab(action_vocab_offset=0)
+        self.action_length = dataset.action_length
+        self.action_vocab_size = len(dataset.action_vocab)
 
-        self.normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
-        self.to_tensor = transforms.ToTensor()
         self._video_paths = self._discover_videos()
 
     def _discover_videos(self) -> List[Path]:
@@ -94,71 +91,150 @@ class MineWorldFrameExtractor:
             action_path = video_path.with_suffix(".jsonl")
             if not action_path.exists():
                 continue
-            actions = self._load_actions(action_path)
             frame_total = self._count_video_frames(video_path)
-            usable = min(frame_total, len(actions))
+            action_total = self._count_actions(action_path)
+            usable = min(frame_total, action_total)
             if usable >= self.context_frames:
                 total += usable - (self.context_frames - 1)
         return total
 
     @staticmethod
-    def _load_actions(action_path: Path) -> List[Dict]:
-        actions: List[Dict] = []
-        with action_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    actions.append(json.loads(line))
-        return actions
-
-    @staticmethod
     def _count_video_frames(video_path: Path) -> int:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            return 0
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        return frame_count
-
-    def _frame_to_tensor(self, frame: np.ndarray) -> torch.Tensor:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (self.resize, self.resize), interpolation=cv2.INTER_AREA)
-        tensor = torch.from_numpy(frame).permute(2, 0, 1).float().div_(255.0)
-        tensor = self.normalize(tensor)
-        return tensor
-
-    def iter_samples(self) -> Iterable[Tuple[torch.Tensor, torch.Tensor]]:
-        for video_path in self._video_paths:
-            action_path = video_path.with_suffix(".jsonl")
-            if not action_path.exists():
-                continue
-            actions = self._load_actions(action_path)
-            cap = cv2.VideoCapture(str(video_path))
-            if not cap.isOpened():
-                cap.release()
-                continue
-
-            frame_idx = 0
-            usable = min(self._count_video_frames(video_path), len(actions))
-            if usable < self.context_frames:
-                cap.release()
-                continue
-
-            while frame_idx < usable:
-                success, frame = cap.read()
-                if not success:
-                    break
-                if frame_idx >= self.context_frames - 1:
-                    tensor = self._frame_to_tensor(frame)
-                    json_action = actions[frame_idx]
-                    env_action, _ = self.mc_dataset.json_action_to_env_action(json_action)
-                    indices = self.mc_dataset.get_action_index_from_actiondict(
-                        env_action, action_vocab_offset=0
-                    )
-                    label = torch.tensor(indices, dtype=torch.long)
-                    yield tensor, label
-                frame_idx += 1
             cap.release()
+            return 0
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return count
+
+    @staticmethod
+    def _count_actions(action_path: Path) -> int:
+        with action_path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+
+    @property
+    def video_paths(self) -> List[Path]:
+        return list(self._video_paths)
+
+
+# Worker globals
+CHUNK_COUNTER = None
+CONTEXT_FRAMES = None
+RESIZE = None
+CHUNK_SIZE = None
+OUTPUT_ROOT = None
+FRAME_DTYPE = None
+NORMALIZE = None
+WORKER_DATASET = None
+
+
+def _worker_init(
+    counter,
+    context_frames: int,
+    resize: int,
+    chunk_size: int,
+    output_root: str,
+    frame_dtype: str,
+) -> None:
+    global CHUNK_COUNTER, CONTEXT_FRAMES, RESIZE, CHUNK_SIZE, OUTPUT_ROOT, FRAME_DTYPE
+    global NORMALIZE, WORKER_DATASET
+    CHUNK_COUNTER = counter
+    CONTEXT_FRAMES = context_frames
+    RESIZE = resize
+    CHUNK_SIZE = chunk_size
+    OUTPUT_ROOT = Path(output_root)
+    FRAME_DTYPE = frame_dtype
+    NORMALIZE = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+    cv2.setNumThreads(1)
+    WORKER_DATASET = MCDataset()
+    WORKER_DATASET.make_action_vocab(action_vocab_offset=0)
+
+
+def _allocate_chunk_index() -> int:
+    with CHUNK_COUNTER.get_lock():  # type: ignore[attr-defined]
+        idx = CHUNK_COUNTER.value  # type: ignore[attr-defined]
+        CHUNK_COUNTER.value += 1  # type: ignore[attr-defined]
+    return idx
+
+
+def _frame_to_tensor(frame: np.ndarray) -> torch.Tensor:
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame = cv2.resize(frame, (RESIZE, RESIZE), interpolation=cv2.INTER_AREA)  # type: ignore[arg-type]
+    tensor = torch.from_numpy(frame).permute(2, 0, 1).float().div_(255.0)
+    tensor = NORMALIZE(tensor)  # type: ignore[arg-type]
+    return tensor
+
+
+def _process_video(video_path: Path) -> Dict:
+    action_path = video_path.with_suffix(".jsonl")
+    if not action_path.exists():
+        return {"num_samples": 0, "chunks": []}
+
+    try:
+        with action_path.open("r", encoding="utf-8") as handle:
+            actions = [json.loads(line) for line in handle if line.strip()]
+    except Exception:
+        return {"num_samples": 0, "chunks": []}
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        return {"num_samples": 0, "chunks": []}
+
+    frame_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    usable = min(frame_total, len(actions))
+    if usable < CONTEXT_FRAMES:  # type: ignore[operator]
+        cap.release()
+        return {"num_samples": 0, "chunks": []}
+
+    chunk_frames: List[torch.Tensor] = []
+    chunk_labels: List[torch.Tensor] = []
+    chunk_entries: List[Dict] = []
+    total_samples = 0
+    frame_idx = 0
+
+    while frame_idx < usable:
+        success, frame = cap.read()
+        if not success:
+            break
+        if frame_idx >= CONTEXT_FRAMES - 1:  # type: ignore[operator]
+            tensor = _frame_to_tensor(frame)
+            json_action = actions[frame_idx]
+            env_action, _ = WORKER_DATASET.json_action_to_env_action(json_action)  # type: ignore[attr-defined]
+            indices = WORKER_DATASET.get_action_index_from_actiondict(  # type: ignore[attr-defined]
+                env_action, action_vocab_offset=0
+            )
+            label = torch.tensor(indices, dtype=torch.long)
+            chunk_frames.append(tensor)
+            chunk_labels.append(label)
+            total_samples += 1
+            if len(chunk_frames) >= CHUNK_SIZE:  # type: ignore[operator]
+                chunk_entries.append(_flush_chunk(chunk_frames, chunk_labels))
+        frame_idx += 1
+
+    cap.release()
+
+    if chunk_frames:
+        chunk_entries.append(_flush_chunk(chunk_frames, chunk_labels))
+
+    return {"num_samples": total_samples, "chunks": chunk_entries}
+
+
+def _flush_chunk(
+    frames: List[torch.Tensor],
+    labels: List[torch.Tensor],
+) -> Dict:
+    chunk_idx = _allocate_chunk_index()
+    chunk_path = OUTPUT_ROOT / f"chunk_{chunk_idx:06d}.pt"  # type: ignore[arg-type]
+    frames_tensor = torch.stack(frames, dim=0).to(
+        torch.float16 if FRAME_DTYPE == "float16" else torch.float32
+    )
+    labels_tensor = torch.stack(labels, dim=0)
+    torch.save({"frames": frames_tensor, "labels": labels_tensor}, chunk_path)
+    frames.clear()
+    labels.clear()
+    return {"file": chunk_path.name, "num_samples": frames_tensor.size(0)}
 
 
 def _ensure_output_dir(path: Path, overwrite: bool) -> None:
@@ -175,21 +251,8 @@ def _ensure_output_dir(path: Path, overwrite: bool) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _save_chunk(
-    output_root: Path,
-    chunk_index: int,
-    frames: List[torch.Tensor],
-    labels: List[torch.Tensor],
-) -> Dict:
-    chunk_path = output_root / f"chunk_{chunk_index:05d}.pt"
-    frames_tensor = torch.stack(frames, dim=0)
-    labels_tensor = torch.stack(labels, dim=0)
-    torch.save({"frames": frames_tensor, "labels": labels_tensor}, chunk_path)
-    return {"file": chunk_path.name, "num_samples": len(frames)}
-
-
 def preprocess_dataset(args: argparse.Namespace) -> None:
-    dataset_cfg, policy_cfg_dict, exp_cfg = _load_hydra_configs(
+    dataset_cfg, _, exp_cfg = _load_hydra_configs(
         dataset_name=args.dataset,
         algorithm_name=args.algorithm,
         experiment_name=args.experiment,
@@ -220,47 +283,58 @@ def preprocess_dataset(args: argparse.Namespace) -> None:
 
     _ensure_output_dir(output_root, overwrite=args.overwrite)
 
-    extractor = MineWorldFrameExtractor(
+    summary = MineWorldFrameSummary(
         data_root=data_root,
         context_frames=context_frames,
         resize=resize,
         recursive=recursive,
     )
 
+    video_paths = summary.video_paths
+    if not video_paths:
+        raise RuntimeError(f"No videos found under {data_root}")
+
     chunk_size = int(args.chunk_size)
     if chunk_size <= 0:
         raise ValueError("--chunk-size must be positive.")
 
-    chunk_frames: List[torch.Tensor] = []
-    chunk_labels: List[torch.Tensor] = []
-    chunk_entries: List[Dict] = []
-    chunk_index = 0
-    total_samples = 0
+    frame_dtype = args.frame_dtype
+    total_estimate = None if args.no_length else len(summary)
 
-    progress = tqdm(
-        extractor.iter_samples(),
+    ctx = mp.get_context("spawn")
+    chunk_counter = ctx.Value("i", 0)
+    num_workers = args.num_workers or ctx.cpu_count()
+
+    sample_progress = tqdm(
+        total=total_estimate,
         desc="processing",
-        total=None if args.no_length else len(extractor),
         ncols=80,
+        unit="sample",
     )
 
-    for frame_tensor, label_tensor in progress:
-        chunk_frames.append(frame_tensor)
-        chunk_labels.append(label_tensor)
+    chunk_entries: List[Dict] = []
+    total_samples = 0
 
-        if len(chunk_frames) >= chunk_size:
-            entry = _save_chunk(output_root, chunk_index, chunk_frames, chunk_labels)
-            chunk_entries.append(entry)
-            total_samples += entry["num_samples"]
-            chunk_frames.clear()
-            chunk_labels.clear()
-            chunk_index += 1
-            progress.set_postfix(samples=total_samples)
+    with ctx.Pool(
+        processes=num_workers,
+        initializer=_worker_init,
+        initargs=(
+            chunk_counter,
+            context_frames,
+            resize,
+            chunk_size,
+            str(output_root),
+            frame_dtype,
+        ),
+    ) as pool:
+        for stats in pool.imap_unordered(_process_video, video_paths):
+            total_samples += stats["num_samples"]
+            chunk_entries.extend(stats["chunks"])
+            sample_progress.update(stats["num_samples"])
 
-    if chunk_frames:
-        entry = _save_chunk(output_root, chunk_index, chunk_frames, chunk_labels)
-        chunk_entries.append(entry)
-        total_samples += entry["num_samples"]
+    sample_progress.close()
+
+    chunk_entries.sort(key=lambda item: item["file"])
 
     metadata = {
         "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -269,12 +343,14 @@ def preprocess_dataset(args: argparse.Namespace) -> None:
         "resize": resize,
         "recursive": recursive,
         "chunk_size": chunk_size,
+        "frame_dtype": frame_dtype,
         "num_samples": total_samples,
-        "action_length": extractor.action_length,
-        "action_vocab_size": extractor.action_vocab_size,
-        "policy_config": policy_cfg_dict,
+        "action_length": summary.action_length,
+        "action_vocab_size": summary.action_vocab_size,
         "training_config": exp_cfg.get("training", {}),
         "chunks": chunk_entries,
+        "num_videos": len(video_paths),
+        "num_workers": num_workers,
     }
 
     with (output_root / "metadata.json").open("w", encoding="utf-8") as handle:
@@ -315,8 +391,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=512,
-        help="Number of samples per shard written to disk.",
+        default=256,
+        help="Number of samples written per shard.",
+    )
+    parser.add_argument(
+        "--frame-dtype",
+        type=str,
+        choices=["float16", "float32"],
+        default="float16",
+        help="Floating point precision to store frames on disk.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Number of parallel decoding workers (default: all cores).",
     )
     parser.add_argument(
         "--context-frames",
@@ -343,7 +432,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-length",
         action="store_true",
-        help="Disable length estimation for tqdm (useful when frame counts are unreliable).",
+        help="Skip sample-count estimation for tqdm.",
     )
     return parser.parse_args()
 
