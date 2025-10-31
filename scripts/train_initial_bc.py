@@ -119,6 +119,8 @@ class MineWorldFrameDataset(Dataset):
         self._capture_cache: dict[Path, cv2.VideoCapture] = {}
         self._last_frame_index: dict[Path, int] = {}
         self._build_index(recursive=recursive)
+        self._max_open_captures = 8
+        self._capture_order: list[Path] = []
 
     def _build_index(self, recursive: bool) -> None:
         pattern = "**/*.mp4" if recursive else "*.mp4"
@@ -162,6 +164,18 @@ class MineWorldFrameDataset(Dataset):
                 raise RuntimeError(f"Failed to open {video_path}")
             self._capture_cache[video_path] = cap
             self._last_frame_index[video_path] = -1
+            self._capture_order.append(video_path)
+            if len(self._capture_order) > self._max_open_captures:
+                oldest = self._capture_order.pop(0)
+                old_cap = self._capture_cache.pop(oldest, None)
+                if old_cap is not None and old_cap.isOpened():
+                    old_cap.release()
+                self._last_frame_index.pop(oldest, None)
+        else:
+            # refresh LRU order
+            if video_path in self._capture_order:
+                self._capture_order.remove(video_path)
+            self._capture_order.append(video_path)
         return cap
 
     def _read_frame(self, video_path: Path, frame_idx: int) -> np.ndarray:
@@ -188,6 +202,7 @@ class MineWorldFrameDataset(Dataset):
         state = self.__dict__.copy()
         state["_capture_cache"] = {}
         state["_last_frame_index"] = {}
+        state["_capture_order"] = []
         return state
 
     def __del__(self) -> None:
