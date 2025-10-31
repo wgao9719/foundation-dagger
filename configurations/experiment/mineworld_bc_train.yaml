@@ -7,6 +7,8 @@ training:
   val_fraction: 0.1
   seed: 0
   checkpoint_interval: 1 
+  num_workers: 16
+  val_num_workers: 8
 
 optimizer:
   lr: 3e-4

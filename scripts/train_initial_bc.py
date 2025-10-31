@@ -38,7 +38,6 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm.auto import tqdm
 from torchvision import transforms
-from torchvision.transforms import InterpolationMode
 import wandb
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -48,6 +47,7 @@ if str(ROOT_DIR) not in sys.path:
 from datasets.mineworld_data.mcdataset import MCDataset
 
 import cv2 
+import numpy as np
 
 CONFIG_DIR = ROOT_DIR / "configurations"
 
@@ -107,6 +107,7 @@ class MineWorldFrameDataset(Dataset):
     ) -> None:
         self.data_root = Path(data_root)
         self.context_frames = context_frames
+        self.resize = resize
         self.samples: list[tuple[Path, Path, int]] = []
         self.actions_cache: dict[Path, list[dict]] = {}
         self.mc_dataset = MCDataset()
@@ -114,17 +115,9 @@ class MineWorldFrameDataset(Dataset):
         self.action_vocab = self.mc_dataset.action_vocab
         self.action_vocab_size = len(self.action_vocab)
         self.action_length = self.mc_dataset.action_length
-
-        self.transform = transforms.Compose(
-            [
-                transforms.ToPILImage(),
-                transforms.Resize(
-                    (resize, resize), interpolation=InterpolationMode.BICUBIC
-                ),
-                transforms.ToTensor(),
-                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-            ]
-        )
+        self.normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+        self._capture_cache: dict[Path, cv2.VideoCapture] = {}
+        self._last_frame_index: dict[Path, int] = {}
         self._build_index(recursive=recursive)
 
     def _build_index(self, recursive: bool) -> None:
@@ -161,23 +154,53 @@ class MineWorldFrameDataset(Dataset):
                 "Found videos but no usable context windows. Ensure .jsonl files align with videos."
             )
 
+    def _get_capture(self, video_path: Path) -> cv2.VideoCapture:
+        cap = self._capture_cache.get(video_path)
+        if cap is None or not cap.isOpened():
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                raise RuntimeError(f"Failed to open {video_path}")
+            self._capture_cache[video_path] = cap
+            self._last_frame_index[video_path] = -1
+        return cap
+
+    def _read_frame(self, video_path: Path, frame_idx: int) -> np.ndarray:
+        cap = self._get_capture(video_path)
+        last_idx = self._last_frame_index.get(video_path, -1)
+        if last_idx + 1 == frame_idx:
+            success, frame = cap.read()
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            success, frame = cap.read()
+        if not success:
+            raise RuntimeError(f"Could not read frame {frame_idx} from {video_path}")
+        self._last_frame_index[video_path] = frame_idx
+        return frame
+
+    def _frame_to_tensor(self, frame: np.ndarray) -> torch.Tensor:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (self.resize, self.resize), interpolation=cv2.INTER_AREA)
+        tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+        tensor = self.normalize(tensor)
+        return tensor
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_capture_cache"] = {}
+        state["_last_frame_index"] = {}
+        return state
+
+    def __del__(self) -> None:
+        for cap in self._capture_cache.values():
+            cap.release()
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         video_path, action_path, frame_idx = self.samples[index]
-
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            cap.release()
-            raise RuntimeError(f"Failed to open {video_path}")
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        success, frame = cap.read()
-        cap.release()
-        if not success:
-            raise RuntimeError(f"Could not read frame {frame_idx} from {video_path}")
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        tensor = self.transform(frame)
+        frame = self._read_frame(video_path, frame_idx)
+        tensor = self._frame_to_tensor(frame)
 
         json_action = self.actions_cache[action_path][frame_idx]
         env_action, _ = self.mc_dataset.json_action_to_env_action(json_action)
@@ -229,7 +252,7 @@ def train_initial_bc(
     random.seed(random_seed)
     random.shuffle(indices)
 
-    val_fraction = fraction
+    val_fraction = float(train_cfg.get("val_fraction", dataset_cfg.get("val_fraction", 0.1)))
     if subset_len <= 1 or val_fraction <= 0:
         val_fraction = 0.0
         val_split = 0
@@ -244,7 +267,6 @@ def train_initial_bc(
 
     train_batch_size = batch_size
     train_epochs = epochs
-        
     train_workers = int(train_cfg.get("num_workers", 4))
     val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
@@ -271,13 +293,17 @@ def train_initial_bc(
         },
     )
 
-    loader = DataLoader(
-        train_subset,
+    prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
+    loader_kwargs = dict(
         batch_size=train_batch_size,
         shuffle=True,
         num_workers=train_workers,
         pin_memory=True,
+        persistent_workers=train_workers > 0,
     )
+    if train_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(prefetch_factor, 1)
+    loader = DataLoader(train_subset, **loader_kwargs)
 
     model = FoundationBCPolicy(policy_cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -301,12 +327,17 @@ def train_initial_bc(
     )
     criterion = nn.CrossEntropyLoss()
 
-    val_loader = DataLoader(
-        val_subset,
+    val_prefetch_factor = int(train_cfg.get("val_prefetch_factor", prefetch_factor))
+    val_loader_kwargs = dict(
         batch_size=val_batch_size,
         num_workers=val_workers,
         pin_memory=True,
+        shuffle=False,
+        persistent_workers=val_workers > 0,
     )
+    if val_workers > 0:
+        val_loader_kwargs["prefetch_factor"] = max(val_prefetch_factor, 1)
+    val_loader = DataLoader(val_subset, **val_loader_kwargs)
 
     def run_epoch(data_loader, train: bool):
         running_loss = 0.0
