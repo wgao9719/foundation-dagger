@@ -30,7 +30,7 @@ class SimpleVisionBackbone(nn.Module):
 
     def __init__(
         self,
-        name: str = "resnet50",
+        name: str = "resnet62",
         pretrained: bool = True,
         trainable: bool = True,
         out_dim: Optional[int] = None,
@@ -98,7 +98,7 @@ class BasePolicyConfig:
 @dataclass
 class PolicyConfig(BasePolicyConfig):
     type: Literal["mlp"] = "mlp"
-    backbone: str = "resnet50"
+    backbone: str = "resnet62"
     pretrained_backbone: bool = True
     backbone_trainable: bool = True
     backbone_dim: Optional[int] = None
@@ -111,7 +111,7 @@ class PolicyConfig(BasePolicyConfig):
 @dataclass
 class VPTPolicyConfig(BasePolicyConfig):
     type: Literal["vpt_causal"] = "vpt_causal"
-    backbone: str = "resnet50"
+    backbone: str = "resnet62"
     pretrained_backbone: bool = True
     backbone_trainable: bool = True
     embed_dim: int = 768
@@ -149,7 +149,10 @@ class FoundationBCPolicy(nn.Module):
         )
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
-        # expects (B, C, H, W)
+        if frames.dim() == 5:
+            frames = frames[:, -1]
+        elif frames.dim() != 4:
+            raise ValueError("Expected input of shape (B, C, H, W) or (B, T, C, H, W).")
         features = self.encoder(frames)
         return self.policy(features)
 

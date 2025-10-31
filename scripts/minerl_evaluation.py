@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
@@ -26,7 +27,12 @@ from torch import Tensor
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-from algorithms.foundation_dagger.policy import BasePolicyConfig, build_policy, parse_policy_config
+from algorithms.foundation_dagger.policy import (
+    BasePolicyConfig,
+    VPTCausalPolicy,
+    build_policy,
+    parse_policy_config,
+)
 from datasets.mineworld_data.mcdataset import MCDataset
 
 
@@ -163,6 +169,7 @@ def evaluate_policy(args: argparse.Namespace) -> None:
 
     resize = int(dataset_cfg.get("resize", dataset_cfg.get("resolution", 256)))
     transform = _build_transform(resize)
+    context_frames = int(dataset_cfg.get("context_frames", 1))
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -195,6 +202,9 @@ def evaluate_policy(args: argparse.Namespace) -> None:
         video_path = run_dir / f"episode_{episode_idx:03d}.mp4"
         writer = imageio.get_writer(video_path, fps=args.video_fps)
 
+        frame_buffer: deque[Tensor] = deque(maxlen=context_frames)
+        mems = None
+
         total_reward = 0.0
         steps = 0
         done = False
@@ -205,7 +215,18 @@ def evaluate_policy(args: argparse.Namespace) -> None:
 
             with torch.no_grad():
                 input_tensor = _prep_frame(frame, transform, device)
-                logits = policy(input_tensor)
+                frame_buffer.append(input_tensor.squeeze(0))
+                if len(frame_buffer) < context_frames:
+                    padded = [frame_buffer[0]] * (context_frames - len(frame_buffer)) + list(frame_buffer)
+                else:
+                    padded = list(frame_buffer)
+                stacked = torch.stack(padded, dim=0).unsqueeze(0)
+
+                if isinstance(policy, VPTCausalPolicy):
+                    logits, mems = policy(stacked, mems=mems, return_mems=True)
+                else:
+                    logits = policy(stacked)
+
                 logits = logits.view(1, action_length, action_vocab_size)
                 token_indices = logits.argmax(dim=-1).squeeze(0).tolist()
 

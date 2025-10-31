@@ -1,6 +1,6 @@
 policy:
   type: vpt_causal
-  backbone: resnet50
+  backbone: resnet62
   pretrained_backbone: true
   backbone_trainable: true
   embed_dim: 768

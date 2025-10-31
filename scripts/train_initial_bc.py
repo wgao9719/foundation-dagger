@@ -2,11 +2,11 @@
 
 The script ingests MineWorld-style trajectories (paired ``.mp4`` videos and
 ``.jsonl`` action logs) and produces a supervised policy checkpoint compatible
-with the ``foundation_dagger`` module. Each training sample uses the final
-frame of an ``N``-frame context window as the observation and maps the
-associated action dictionary to one of four movement classes (forward, back,
-left, right). Only a user-specified fraction of the available samples is used
-to keep the bootstrap stage quick.
+with the ``foundation_dagger`` module. Each training sample stacks the full
+``N``-frame context window and predicts the action token sequence associated
+with the final frame, enabling Transformer-style policies to leverage temporal
+attention while still supporting single-frame heads. Only a user-specified
+fraction of the available samples is used to keep the bootstrap stage quick.
 
 Example
 -------
@@ -31,7 +31,7 @@ from pathlib import Path
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -51,7 +51,13 @@ import numpy as np
 
 CONFIG_DIR = ROOT_DIR / "configurations"
 
-from algorithms.foundation_dagger.policy import BasePolicyConfig, build_policy, parse_policy_config
+from algorithms.foundation_dagger.policy import (
+    BasePolicyConfig,
+    VPTCausalPolicy,
+    VPTPolicyConfig,
+    build_policy,
+    parse_policy_config,
+)
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -108,7 +114,7 @@ class MineWorldFrameDataset(Dataset):
         self.data_root = Path(data_root)
         self.context_frames = context_frames
         self.resize = resize
-        self.samples: list[tuple[Path, Path, int]] = []
+        self.samples: list[tuple[Path, Path, int, int]] = []
         self.actions_cache: dict[Path, list[dict]] = {}
         self.mc_dataset = MCDataset()
         self.mc_dataset.make_action_vocab(action_vocab_offset=0)
@@ -118,6 +124,7 @@ class MineWorldFrameDataset(Dataset):
         self.normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
         self._capture_cache: dict[Path, cv2.VideoCapture] = {}
         self._last_frame_index: dict[Path, int] = {}
+        self._video_ids: dict[Path, int] = {}
         self._build_index(recursive=recursive)
         self._max_open_captures = 8
         self._capture_order: list[Path] = []
@@ -148,12 +155,13 @@ class MineWorldFrameDataset(Dataset):
             cap.release()
 
             usable = min(frame_count, len(actions))
+            video_id = self._video_ids.setdefault(video_path, len(self._video_ids))
             for frame_idx in range(self.context_frames - 1, usable):
                 json_action = actions[frame_idx]
                 _, is_null_action = self.mc_dataset.json_action_to_env_action(json_action)
                 if is_null_action:
                     continue
-                self.samples.append((video_path, action_path, frame_idx))
+                self.samples.append((video_path, action_path, frame_idx, video_id))
 
         if not self.samples:
             raise RuntimeError(
@@ -216,16 +224,21 @@ class MineWorldFrameDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        video_path, action_path, frame_idx = self.samples[index]
-        frame = self._read_frame(video_path, frame_idx)
-        tensor = self._frame_to_tensor(frame)
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        video_path, action_path, frame_idx, video_id = self.samples[index]
+        start_idx = frame_idx - (self.context_frames - 1)
+        frame_tensors: list[torch.Tensor] = []
+        for idx in range(start_idx, frame_idx + 1):
+            frame = self._read_frame(video_path, idx)
+            tensor = self._frame_to_tensor(frame)
+            frame_tensors.append(tensor)
+        frames_tensor = torch.stack(frame_tensors, dim=0)
 
         json_action = self.actions_cache[action_path][frame_idx]
         env_action, _ = self.mc_dataset.json_action_to_env_action(json_action)
         action_indices = self.mc_dataset.get_action_index_from_actiondict(env_action, action_vocab_offset=0)
         label = torch.tensor(action_indices, dtype=torch.long)
-        return tensor, label
+        return frames_tensor, label, torch.tensor(video_id, dtype=torch.long), torch.tensor(frame_idx, dtype=torch.long)
 
 
 def train_initial_bc(
@@ -269,7 +282,18 @@ def train_initial_bc(
     indices = list(range(len(dataset)))
     random_seed = int(train_cfg.get("seed", dataset_cfg.get("seed", 0)))
     random.seed(random_seed)
-    random.shuffle(indices)
+    if isinstance(policy_cfg, VPTPolicyConfig):
+        # Shuffle at the video level while preserving chronological ordering inside each video.
+        video_to_indices: Dict[int, List[int]] = {}
+        for idx, (_, _, _, vid) in enumerate(dataset.samples):
+            video_to_indices.setdefault(int(vid), []).append(idx)
+        video_ids = list(video_to_indices.keys())
+        random.shuffle(video_ids)
+        indices = []
+        for vid in video_ids:
+            indices.extend(video_to_indices[vid])
+    else:
+        random.shuffle(indices)
 
     val_fraction = float(train_cfg.get("val_fraction", dataset_cfg.get("val_fraction", 0.1)))
     if subset_len <= 1 or val_fraction <= 0:
@@ -281,6 +305,9 @@ def train_initial_bc(
             val_split = max(1, subset_len - 1)
     val_indices = indices[:val_split]
     train_indices = indices[val_split:subset_len]
+    if isinstance(policy_cfg, VPTPolicyConfig):
+        val_indices = sorted(val_indices)
+        train_indices = sorted(train_indices)
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
 
@@ -312,13 +339,14 @@ def train_initial_bc(
         },
     )
 
+    use_memory = isinstance(policy_cfg, VPTPolicyConfig)
     prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
     loader_kwargs = dict(
         batch_size=train_batch_size,
-        shuffle=True,
+        shuffle=not use_memory,
         num_workers=train_workers,
         pin_memory=True,
-        persistent_workers=train_workers > 0,
+        persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
     )
     if train_workers > 0:
         loader_kwargs["prefetch_factor"] = max(prefetch_factor, 1)
@@ -352,7 +380,7 @@ def train_initial_bc(
         num_workers=val_workers,
         pin_memory=True,
         shuffle=False,
-        persistent_workers=val_workers > 0,
+        persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
     )
     if val_workers > 0:
         val_loader_kwargs["prefetch_factor"] = max(val_prefetch_factor, 1)
@@ -366,17 +394,52 @@ def train_initial_bc(
             model.train()
         else:
             model.eval()
+        use_transformer = isinstance(model, VPTCausalPolicy)
+        mem_bank: dict[int, Optional[Sequence[torch.Tensor]]] = {} if use_transformer else {}
+        last_frame_index: dict[int, int] = {} if use_transformer else {}
+        sample_outputs: list[tuple[list[int], list[int]]] = []
         iterator = tqdm(
             data_loader,
             desc="train" if train else "val",
             leave=False,
             ncols=80,
         )
-        for observations, labels in iterator:
+        for batch in iterator:
+            if isinstance(batch, (tuple, list)) and len(batch) == 4:
+                observations, labels, video_ids, frame_indices = batch
+            else:
+                observations, labels = batch
+                video_ids = None
+                frame_indices = None
             observations = observations.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+            if video_ids is not None:
+                video_ids_list = video_ids.cpu().tolist()
+                frame_indices_list = frame_indices.cpu().tolist()
+            else:
+                video_ids_list = None
+                frame_indices_list = None
             with torch.set_grad_enabled(train):
-                logits = model(observations)
+                if use_transformer:
+                    batch_logits: list[torch.Tensor] = []
+                    for sample_idx in range(observations.size(0)):
+                        vid = int(video_ids_list[sample_idx]) if video_ids_list is not None else sample_idx
+                        frame_idx = int(frame_indices_list[sample_idx]) if frame_indices_list is not None else -1
+                        mem = mem_bank.get(vid)
+                        last_idx = last_frame_index.get(vid)
+                        if last_idx is None or frame_idx != last_idx + 1:
+                            mem = None
+                        logits_i, new_mem = model(
+                            observations[sample_idx : sample_idx + 1],
+                            mems=mem,
+                            return_mems=True,
+                        )
+                        mem_bank[vid] = new_mem
+                        last_frame_index[vid] = frame_idx
+                        batch_logits.append(logits_i)
+                    logits = torch.cat(batch_logits, dim=0)
+                else:
+                    logits = model(observations)
                 logits = logits.view(observations.size(0), action_length, action_vocab_size)
                 loss = criterion(logits.view(-1, action_vocab_size), labels.view(-1))
                 if train:
@@ -388,21 +451,30 @@ def train_initial_bc(
             token_acc = (preds == labels).float().mean(dim=1)
             running_acc += token_acc.sum().item()
             count += observations.size(0)
+            if not train and len(sample_outputs) < 3:
+                max_samples = min(observations.size(0), 3 - len(sample_outputs))
+                for sample_idx in range(max_samples):
+                    sample_outputs.append(
+                        (
+                            labels[sample_idx].detach().cpu().view(-1).tolist(),
+                            preds[sample_idx].detach().cpu().view(-1).tolist(),
+                        )
+                    )
             if count > 0:
                 iterator.set_postfix(
                     loss=f"{running_loss / count:.4f}",
                     acc=f"{running_acc / count:.4f}",
                 )
         if count == 0:
-            return 0.0, 0.0
-        return running_loss / count, running_acc / count
+            return 0.0, 0.0, sample_outputs
+        return running_loss / count, running_acc / count, sample_outputs
 
     for epoch in range(train_epochs):
-        train_loss, train_acc = run_epoch(loader, train=True)
+        train_loss, train_acc, _ = run_epoch(loader, train=True)
         if len(val_subset) > 0:
-            val_loss, val_acc = run_epoch(val_loader, train=False)
+            val_loss, val_acc, val_samples = run_epoch(val_loader, train=False)
         else:
-            val_loss, val_acc = None, None
+            val_loss, val_acc, val_samples = None, None, []
         metrics = {"train/loss": train_loss, "train/acc": train_acc}
         if val_loss is not None:
             metrics["val/loss"] = val_loss
@@ -413,6 +485,10 @@ def train_initial_bc(
                 f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f} "
                 f"- val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f}"
             )
+            if val_samples:
+                print("Validation samples (target vs. prediction):")
+                for idx, (target_tokens, pred_tokens) in enumerate(val_samples, start=1):
+                    print(f"  Sample {idx}: target={target_tokens} pred={pred_tokens}")
         else:
             print(
                 f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f}"
