@@ -3,7 +3,7 @@
 The script loads a `FoundationBCPolicy`, performs greedy rollouts in a chosen
 MineRL-Gym task, and saves episode videos for qualitative inspection.
 
-python diffusion-forcing-transformer/scripts/minerl_evaluation.py --checkpoint outputs/bootstrap_bc.ckpt --env-id MineRLBasaltFindCave-v0
+python -m scripts.minerl_evaluation --checkpoint checkpoints/bc_policy.ckpt --env-id MineRLBasaltFindCave-v0
 """
 
 from __future__ import annotations

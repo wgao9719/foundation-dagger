@@ -1,5 +1,6 @@
 # Project-specific
 notes.txt
+notes_run_comm.txt
 outputs/
 wandb/
 checkpoints/

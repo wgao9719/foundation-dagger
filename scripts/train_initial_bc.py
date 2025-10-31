@@ -36,6 +36,7 @@ from typing import Dict, List, Tuple
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
+from tqdm.auto import tqdm
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 import wandb
@@ -315,7 +316,13 @@ def train_initial_bc(
             model.train()
         else:
             model.eval()
-        for observations, labels in data_loader:
+        iterator = tqdm(
+            data_loader,
+            desc="train" if train else "val",
+            leave=False,
+            ncols=80,
+        )
+        for observations, labels in iterator:
             observations = observations.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             with torch.set_grad_enabled(train):
@@ -331,6 +338,11 @@ def train_initial_bc(
             token_acc = (preds == labels).float().mean(dim=1)
             running_acc += token_acc.sum().item()
             count += observations.size(0)
+            if count > 0:
+                iterator.set_postfix(
+                    loss=f"{running_loss / count:.4f}",
+                    acc=f"{running_acc / count:.4f}",
+                )
         if count == 0:
             return 0.0, 0.0
         return running_loss / count, running_acc / count
