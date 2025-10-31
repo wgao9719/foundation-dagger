@@ -5,6 +5,7 @@ defaults:
 name: mineworld_frames
 # Root directory that contains MineWorld VPT-style videos and jsonl action logs.
 data_root: data/mineworld_split/train
+processed_root: data/processed_mineworld_frames
 
 context_frames: 8
 frame_skip: 1

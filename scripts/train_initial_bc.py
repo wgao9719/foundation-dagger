@@ -27,6 +27,7 @@ import json
 import random
 import sys
 from pathlib import Path
+from bisect import bisect_right
 
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
@@ -55,6 +56,92 @@ from algorithms.foundation_dagger.policy import FoundationBCPolicy, PolicyConfig
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+class ProcessedMineWorldDataset(Dataset):
+    """
+    Dataset wrapper for preprocessed MineWorld chunks stored under a directory.
+    """
+
+    def __init__(self, processed_root: Path, cache_size: int = 2) -> None:
+        self.processed_root = Path(processed_root)
+        meta_path = self.processed_root / "metadata.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"Processed metadata not found at {meta_path}. "
+                "Run preprocess_mineworld_frames.py before consuming the dataset."
+            )
+        with meta_path.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+
+        self.metadata = metadata
+        self.context_frames = int(metadata["context_frames"])
+        self.resize = int(metadata.get("resize", 256))
+        self.action_length = int(metadata["action_length"])
+        self.action_vocab_size = int(metadata["action_vocab_size"])
+        self.total_samples = int(metadata["num_samples"])
+
+        self.chunks = metadata.get("chunks", [])
+        if not self.chunks:
+            raise ValueError("Processed dataset metadata does not list any chunks.")
+
+        cumulative: list[int] = []
+        total = 0
+        for entry in self.chunks:
+            count = int(entry["num_samples"])
+            if count <= 0:
+                continue
+            total += count
+            cumulative.append(total)
+        if total != self.total_samples:
+            self.total_samples = total
+        self.cumulative_sizes = cumulative
+
+        self.cache_size = max(1, cache_size)
+        self._chunk_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._chunk_order: list[int] = []
+
+    def __len__(self) -> int:
+        return self.total_samples
+
+    def _prune_cache(self) -> None:
+        while len(self._chunk_order) > self.cache_size:
+            oldest = self._chunk_order.pop(0)
+            self._chunk_cache.pop(oldest, None)
+
+    def _get_chunk(self, chunk_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cached = self._chunk_cache.get(chunk_idx)
+        if cached is not None:
+            if chunk_idx in self._chunk_order:
+                self._chunk_order.remove(chunk_idx)
+            self._chunk_order.append(chunk_idx)
+            return cached
+
+        entry = self.chunks[chunk_idx]
+        chunk_path = self.processed_root / entry["file"]
+        if not chunk_path.exists():
+            raise FileNotFoundError(f"Missing processed chunk file at {chunk_path}")
+        data = torch.load(chunk_path, map_location="cpu")
+        frames = data["frames"].float()
+        labels = data["labels"].long()
+        self._chunk_cache[chunk_idx] = (frames, labels)
+        self._chunk_order.append(chunk_idx)
+        self._prune_cache()
+        return frames, labels
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if index < 0 or index >= len(self):
+            raise IndexError(f"Index {index} out of range for dataset of size {len(self)}")
+        chunk_idx = bisect_right(self.cumulative_sizes, index)
+        chunk_start = 0 if chunk_idx == 0 else self.cumulative_sizes[chunk_idx - 1]
+        local_idx = index - chunk_start
+        frames, labels = self._get_chunk(chunk_idx)
+        return frames[local_idx], labels[local_idx]
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_chunk_cache"] = {}
+        state["_chunk_order"] = []
+        return state
 
 
 def _load_hydra_configs(
@@ -237,6 +324,9 @@ def train_initial_bc(
     policy_cfg_dict: Dict,
     dataset_name: str,
     exp_cfg: Dict,
+    processed_root: Path | None,
+    chunk_cache_size: int,
+    require_processed: bool,
 ) -> None:
     policy_cfg = PolicyConfig(**policy_cfg_dict)
     action_keys_cfg = dataset_cfg.get("action_keys")
@@ -248,12 +338,34 @@ def train_initial_bc(
     if action_classes is not None:
         policy_cfg.action_dim = int(action_classes)
 
-    dataset = MineWorldFrameDataset(
-        data_root=data_root,
-        context_frames=context_frames,
-        resize=resize,
-        recursive=recursive,
-    )
+    dataset: Dataset
+    processed_used = False
+    if processed_root is not None:
+        try:
+            dataset = ProcessedMineWorldDataset(
+                processed_root=processed_root,
+                cache_size=max(1, chunk_cache_size),
+            )
+            processed_used = True
+            context_frames = dataset.context_frames  # type: ignore[attr-defined]
+            resize = dataset.resize  # type: ignore[attr-defined]
+        except (FileNotFoundError, ValueError) as exc:
+            if require_processed:
+                raise
+            print(
+                f"[train_initial_bc] Processed dataset unavailable ({exc}). "
+                "Falling back to raw MineWorld videos."
+            )
+            processed_used = False
+
+    if not processed_used:
+        dataset = MineWorldFrameDataset(
+            data_root=data_root,
+            context_frames=context_frames,
+            resize=resize,
+            recursive=recursive,
+        )
+
     action_length = dataset.action_length
     action_vocab_size = dataset.action_vocab_size
     policy_cfg.action_dim = action_vocab_size * action_length
@@ -305,6 +417,9 @@ def train_initial_bc(
             "policy_output_dim": policy_cfg.action_dim,
             "train_samples": len(train_subset),
             "val_samples": len(val_subset),
+            "processed": processed_used,
+            "processed_root": str(processed_root) if processed_root is not None else None,
+            "chunk_cache_size": chunk_cache_size if processed_used else None,
         },
     )
 
@@ -437,6 +552,12 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing MineWorld .mp4 videos and matching .jsonl logs. Overrides config if provided.",
     )
     parser.add_argument(
+        "--processed-root",
+        type=Path,
+        default=None,
+        help="Directory containing preprocessed MineWorld chunks.",
+    )
+    parser.add_argument(
         "--fraction", 
         type=float, 
         default=1.0 / 6, 
@@ -447,6 +568,17 @@ def parse_args() -> argparse.Namespace:
         type=int, 
         default=5, 
         help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--chunk-cache-size",
+        type=int,
+        default=2,
+        help="Number of processed chunks to keep in memory per worker.",
+    )
+    parser.add_argument(
+        "--require-processed",
+        action="store_true",
+        help="Fail if the processed dataset is unavailable.",
     )
     parser.add_argument(
         "--batch-size", 
@@ -522,11 +654,25 @@ if __name__ == "__main__":
     if args.output is not None:
         output = args.output
     else:
-        output = dataset_cfg.get("output", "checkpoints/bc_policy.ckpt")
+        output = Path(dataset_cfg.get("output", "checkpoints/bc_policy.ckpt"))
+    if not isinstance(output, Path):
+        output = Path(output)
+    if not output.is_absolute():
+        output = (ROOT_DIR / output).resolve()
 
     recursive = dataset_cfg.get("recursive", True)
     if args.no_recursive:
         recursive = False
+
+    processed_root_value = args.processed_root or dataset_cfg.get("processed_root")
+    processed_root = None
+    if processed_root_value is not None:
+        processed_root = Path(processed_root_value)
+        if not processed_root.is_absolute():
+            processed_root = (ROOT_DIR / processed_root).resolve()
+
+    training_cfg = exp_cfg.get("training", {})
+    chunk_cache_size = int(training_cfg.get("chunk_cache_size", args.chunk_cache_size))
 
     train_initial_bc(
         data_root=data_root,
@@ -541,4 +687,7 @@ if __name__ == "__main__":
         policy_cfg_dict=policy_cfg_dict,
         dataset_name=dataset_name,
         exp_cfg=exp_cfg,
+        processed_root=processed_root,
+        chunk_cache_size=max(1, chunk_cache_size),
+        require_processed=args.require_processed,
     )
