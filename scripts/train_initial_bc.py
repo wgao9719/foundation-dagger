@@ -51,7 +51,7 @@ import numpy as np
 
 CONFIG_DIR = ROOT_DIR / "configurations"
 
-from algorithms.foundation_dagger.policy import FoundationBCPolicy, PolicyConfig
+from algorithms.foundation_dagger.policy import BasePolicyConfig, build_policy, parse_policy_config
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -149,6 +149,10 @@ class MineWorldFrameDataset(Dataset):
 
             usable = min(frame_count, len(actions))
             for frame_idx in range(self.context_frames - 1, usable):
+                json_action = actions[frame_idx]
+                _, is_null_action = self.mc_dataset.json_action_to_env_action(json_action)
+                if is_null_action:
+                    continue
                 self.samples.append((video_path, action_path, frame_idx))
 
         if not self.samples:
@@ -238,7 +242,7 @@ def train_initial_bc(
     dataset_name: str,
     exp_cfg: Dict,
 ) -> None:
-    policy_cfg = PolicyConfig(**policy_cfg_dict)
+    policy_cfg: BasePolicyConfig = parse_policy_config(policy_cfg_dict)
     action_keys_cfg = dataset_cfg.get("action_keys")
     if action_keys_cfg:
         policy_cfg.action_dim = len(action_keys_cfg)
@@ -320,7 +324,7 @@ def train_initial_bc(
         loader_kwargs["prefetch_factor"] = max(prefetch_factor, 1)
     loader = DataLoader(train_subset, **loader_kwargs)
 
-    model = FoundationBCPolicy(policy_cfg)
+    model = build_policy(policy_cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 

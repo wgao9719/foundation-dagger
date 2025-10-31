@@ -26,7 +26,7 @@ from torch import Tensor
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-from algorithms.foundation_dagger.policy import FoundationBCPolicy, PolicyConfig
+from algorithms.foundation_dagger.policy import BasePolicyConfig, build_policy, parse_policy_config
 from datasets.mineworld_data.mcdataset import MCDataset
 
 
@@ -154,7 +154,7 @@ def evaluate_policy(args: argparse.Namespace) -> None:
         experiment_name=args.experiment,
     )
 
-    policy_cfg = PolicyConfig(**policy_cfg_dict)
+    policy_cfg: BasePolicyConfig = parse_policy_config(policy_cfg_dict)
     mc_dataset = MCDataset()
     mc_dataset.make_action_vocab(action_vocab_offset=0)
     action_length = mc_dataset.action_length
@@ -170,7 +170,7 @@ def evaluate_policy(args: argparse.Namespace) -> None:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
-    policy = FoundationBCPolicy(policy_cfg).to(device)
+    policy = build_policy(policy_cfg).to(device)
     state_dict = torch.load(checkpoint_path, map_location=device)
     policy.load_state_dict(state_dict)
     policy.eval()

@@ -9,12 +9,12 @@ import torch.nn.functional as F
 import lightning.pytorch as pl
 from omegaconf import DictConfig, OmegaConf
 
-from .policy import FoundationBCPolicy, PolicyConfig
+from .policy import BasePolicyConfig, build_policy, parse_policy_config
 
 
-def _policy_cfg_from_dict(cfg: DictConfig | Dict) -> PolicyConfig:
+def _policy_cfg_from_dict(cfg: DictConfig | Dict) -> BasePolicyConfig:
     data = OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else cfg
-    return PolicyConfig(**data)
+    return parse_policy_config(data)
 
 
 @dataclass
@@ -38,7 +38,7 @@ class FoundationDaggerModule(pl.LightningModule):
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
         self.cfg = cfg
         policy_cfg = _policy_cfg_from_dict(cfg.policy)
-        self.policy = FoundationBCPolicy(policy_cfg)
+        self.policy = build_policy(policy_cfg)
         self.criterion = nn.CrossEntropyLoss()
         self.optim_cfg = OptimizationConfig(**OmegaConf.to_container(cfg.optim, resolve=True))
         self.action_dim = policy_cfg.action_dim
