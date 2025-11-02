@@ -2,15 +2,22 @@ defaults:
   - _self_
 
 training:
-  batch_size: 32
+  #batch_size: 32
+  batch_size: 80
   epochs: 5
   val_fraction: 0.01
   seed: 0
   checkpoint_interval: 1 
   num_workers: 64
   val_num_workers: 4
+  camera_gate_weight: 1.0
 
 optimizer:
-  lr: 3e-4
-  weight_decay: 1e-4
+  lr: 0.002147
+  weight_decay: 0.0625
   betas: [0.9, 0.99]
+
+# optimizer:
+#   lr: 3e-4
+#   weight_decay: 1e-4
+#   betas: [0.9, 0.99]

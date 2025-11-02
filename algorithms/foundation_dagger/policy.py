@@ -30,7 +30,7 @@ class SimpleVisionBackbone(nn.Module):
 
     def __init__(
         self,
-        name: str = "resnet62",
+        name: str = "resnet50",
         pretrained: bool = True,
         trainable: bool = True,
         out_dim: Optional[int] = None,
@@ -98,7 +98,7 @@ class BasePolicyConfig:
 @dataclass
 class PolicyConfig(BasePolicyConfig):
     type: Literal["mlp"] = "mlp"
-    backbone: str = "resnet62"
+    backbone: str = "resnet50"
     pretrained_backbone: bool = True
     backbone_trainable: bool = True
     backbone_dim: Optional[int] = None
@@ -111,7 +111,7 @@ class PolicyConfig(BasePolicyConfig):
 @dataclass
 class VPTPolicyConfig(BasePolicyConfig):
     type: Literal["vpt_causal"] = "vpt_causal"
-    backbone: str = "resnet62"
+    backbone: str = "resnet50"
     pretrained_backbone: bool = True
     backbone_trainable: bool = True
     embed_dim: int = 768
@@ -147,14 +147,24 @@ class FoundationBCPolicy(nn.Module):
             dropout=cfg.dropout,
             activation=cfg.activation,
         )
+        self.camera_gate = nn.Linear(head_input, 1)
 
-    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        frames: torch.Tensor,
+        return_gate: bool = False,
+        **_: object,
+    ):
         if frames.dim() == 5:
             frames = frames[:, -1]
         elif frames.dim() != 4:
             raise ValueError("Expected input of shape (B, C, H, W) or (B, T, C, H, W).")
         features = self.encoder(frames)
-        return self.policy(features)
+        logits = self.policy(features)
+        if not return_gate:
+            return logits
+        gate_logits = self.camera_gate(features).squeeze(-1)
+        return logits, gate_logits
 
 
 class PositionalEmbedding(nn.Module):
@@ -377,6 +387,7 @@ class VPTCausalPolicy(nn.Module):
         )
         self.final_norm = nn.LayerNorm(cfg.embed_dim, eps=cfg.layer_norm_eps)
         self.policy = nn.Linear(cfg.embed_dim, cfg.action_dim)
+        self.camera_gate_head = nn.Linear(cfg.embed_dim, 1)
 
     def _causal_mask(self, qlen: int, mlen: int, device: torch.device) -> Optional[torch.Tensor]:
         if qlen <= 0:
@@ -404,6 +415,7 @@ class VPTCausalPolicy(nn.Module):
         mems: Optional[Sequence[Optional[torch.Tensor]]] = None,
         return_mems: bool = False,
         return_all_tokens: bool = False,
+        return_gate: bool = False,
     ):
         if frames.dim() == 4:
             frames = frames.unsqueeze(1)
@@ -436,11 +448,19 @@ class VPTCausalPolicy(nn.Module):
             output, new_mem = layer(output, pos_emb, attn_mask=attn_mask, mem=mem)
             new_mems.append(new_mem)
 
-        logits_all = self.policy(self.final_norm(output))
+        final_hidden = self.final_norm(output)
+        logits_all = self.policy(final_hidden)
         logits = logits_all if return_all_tokens else logits_all[:, -1]
+        gate_logits = None
+        if return_gate:
+            gate_logits = self.camera_gate_head(final_hidden[:, -1]).squeeze(-1)
 
         if return_mems:
+            if return_gate:
+                return logits, gate_logits, new_mems
             return logits, new_mems
+        if return_gate:
+            return logits, gate_logits
         return logits
 
 

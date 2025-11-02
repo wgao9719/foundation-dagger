@@ -1,5 +1,0 @@
-algorithm:
-  backbone:
-    depth: 12
-    hidden_size: 768
-    num_heads: 12

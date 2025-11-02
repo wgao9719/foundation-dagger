@@ -1,4 +1,0 @@
-algorithm:
-  noise_level: random_uniform
-  fixed_context:
-    enabled: true

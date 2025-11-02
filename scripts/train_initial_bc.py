@@ -23,7 +23,6 @@ python scripts/train_initial_bc.py \
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import sys
 from pathlib import Path
@@ -35,19 +34,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, Subset
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
-from torchvision import transforms
 import wandb
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from datasets.mineworld_data.mcdataset import MCDataset
-
-import cv2 
-import numpy as np
+from datasets.mineworld_data.mineworld_frame_dataset import MineWorldFrameDataset
 
 CONFIG_DIR = ROOT_DIR / "configurations"
 
@@ -59,8 +55,7 @@ from algorithms.foundation_dagger.policy import (
     parse_policy_config,
 )
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+IGNORE_INDEX = -100
 
 
 def _load_hydra_configs(
@@ -86,161 +81,6 @@ def _load_hydra_configs(
     exp_cfg = OmegaConf.to_container(cfg.experiment, resolve=True)
     return dataset_cfg, policy_cfg, exp_cfg
 
-def _load_actions(json_path: Path) -> List[Dict]:
-    if not json_path.exists():
-        raise FileNotFoundError(f"Missing action log for {json_path}")
-    actions: List[Dict] = []
-    with json_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            actions.append(json.loads(line))
-    return actions
-
-
-class MineWorldFrameDataset(Dataset):
-    """
-    Sliding-window dataset over MineWorld trajectories.
-    """
-
-    def __init__(
-        self,
-        data_root: Path,
-        context_frames: int = 8,
-        resize: int = 256,
-        recursive: bool = True,
-    ) -> None:
-        self.data_root = Path(data_root)
-        self.context_frames = context_frames
-        self.resize = resize
-        self.samples: list[tuple[Path, Path, int, int]] = []
-        self.actions_cache: dict[Path, list[dict]] = {}
-        self.mc_dataset = MCDataset()
-        self.mc_dataset.make_action_vocab(action_vocab_offset=0)
-        self.action_vocab = self.mc_dataset.action_vocab
-        self.action_vocab_size = len(self.action_vocab)
-        self.action_length = self.mc_dataset.action_length
-        self.normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
-        self._capture_cache: dict[Path, cv2.VideoCapture] = {}
-        self._last_frame_index: dict[Path, int] = {}
-        self._video_ids: dict[Path, int] = {}
-        self._build_index(recursive=recursive)
-        self._max_open_captures = 8
-        self._capture_order: list[Path] = []
-
-    def _build_index(self, recursive: bool) -> None:
-        pattern = "**/*.mp4" if recursive else "*.mp4"
-        video_paths = sorted(self.data_root.glob(pattern))
-        if not video_paths:
-            raise FileNotFoundError(
-                f"No .mp4 files found under {self.data_root}. "
-                "Pass the MineWorld data directory via --data-root."
-            )
-
-        for video_path in video_paths:
-            action_path = video_path.with_suffix(".jsonl")
-            try:
-                actions = self.actions_cache.setdefault(
-                    action_path, _load_actions(action_path)
-                )
-            except FileNotFoundError:
-                continue
-
-            cap = cv2.VideoCapture(str(video_path))
-            if not cap.isOpened():
-                cap.release()
-                continue
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
-
-            usable = min(frame_count, len(actions))
-            video_id = self._video_ids.setdefault(video_path, len(self._video_ids))
-            for frame_idx in range(self.context_frames - 1, usable):
-                json_action = actions[frame_idx]
-                _, is_null_action = self.mc_dataset.json_action_to_env_action(json_action)
-                if is_null_action:
-                    continue
-                self.samples.append((video_path, action_path, frame_idx, video_id))
-
-        if not self.samples:
-            raise RuntimeError(
-                "Found videos but no usable context windows. Ensure .jsonl files align with videos."
-            )
-
-    def _get_capture(self, video_path: Path) -> cv2.VideoCapture:
-        cap = self._capture_cache.get(video_path)
-        if cap is None or not cap.isOpened():
-            cap = cv2.VideoCapture(str(video_path))
-            if not cap.isOpened():
-                raise RuntimeError(f"Failed to open {video_path}")
-            self._capture_cache[video_path] = cap
-            self._last_frame_index[video_path] = -1
-            self._capture_order.append(video_path)
-            if len(self._capture_order) > self._max_open_captures:
-                oldest = self._capture_order.pop(0)
-                old_cap = self._capture_cache.pop(oldest, None)
-                if old_cap is not None and old_cap.isOpened():
-                    old_cap.release()
-                self._last_frame_index.pop(oldest, None)
-        else:
-            # refresh LRU order
-            if video_path in self._capture_order:
-                self._capture_order.remove(video_path)
-            self._capture_order.append(video_path)
-        return cap
-
-    def _read_frame(self, video_path: Path, frame_idx: int) -> np.ndarray:
-        cap = self._get_capture(video_path)
-        last_idx = self._last_frame_index.get(video_path, -1)
-        if last_idx + 1 == frame_idx:
-            success, frame = cap.read()
-        else:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            success, frame = cap.read()
-        if not success:
-            raise RuntimeError(f"Could not read frame {frame_idx} from {video_path}")
-        self._last_frame_index[video_path] = frame_idx
-        return frame
-
-    def _frame_to_tensor(self, frame: np.ndarray) -> torch.Tensor:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (self.resize, self.resize), interpolation=cv2.INTER_AREA)
-        tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
-        tensor = self.normalize(tensor)
-        return tensor
-
-    def __getstate__(self) -> dict:
-        state = self.__dict__.copy()
-        state["_capture_cache"] = {}
-        state["_last_frame_index"] = {}
-        state["_capture_order"] = []
-        return state
-
-    def __del__(self) -> None:
-        for cap in self._capture_cache.values():
-            cap.release()
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        video_path, action_path, frame_idx, video_id = self.samples[index]
-        start_idx = frame_idx - (self.context_frames - 1)
-        frame_tensors: list[torch.Tensor] = []
-        for idx in range(start_idx, frame_idx + 1):
-            frame = self._read_frame(video_path, idx)
-            tensor = self._frame_to_tensor(frame)
-            frame_tensors.append(tensor)
-        frames_tensor = torch.stack(frame_tensors, dim=0)
-
-        json_action = self.actions_cache[action_path][frame_idx]
-        env_action, _ = self.mc_dataset.json_action_to_env_action(json_action)
-        action_indices = self.mc_dataset.get_action_index_from_actiondict(env_action, action_vocab_offset=0)
-        label = torch.tensor(action_indices, dtype=torch.long)
-        return frames_tensor, label, torch.tensor(video_id, dtype=torch.long), torch.tensor(frame_idx, dtype=torch.long)
-
-
 def train_initial_bc(
     data_root: Path,
     fraction: float,
@@ -255,6 +95,7 @@ def train_initial_bc(
     dataset_name: str,
     exp_cfg: Dict,
 ) -> None:
+    # get configs
     policy_cfg: BasePolicyConfig = parse_policy_config(policy_cfg_dict)
     action_keys_cfg = dataset_cfg.get("action_keys")
     if action_keys_cfg:
@@ -265,12 +106,17 @@ def train_initial_bc(
     if action_classes is not None:
         policy_cfg.action_dim = int(action_classes)
 
+    #initialize dataset
     dataset = MineWorldFrameDataset(
         data_root=data_root,
         context_frames=context_frames,
         resize=resize,
         recursive=recursive,
+        max_open_captures=int(dataset_cfg.get("max_open_captures", 2)),
     )
+    camera_token_indices = dataset.camera_token_indices
+    camera_center_tokens = dataset.camera_center_tokens
+    # get action length and vocabulary size
     action_length = dataset.action_length
     action_vocab_size = dataset.action_vocab_size
     policy_cfg.action_dim = action_vocab_size * action_length
@@ -278,12 +124,13 @@ def train_initial_bc(
     train_cfg = exp_cfg.get("training", {})
     opt_cfg = exp_cfg.get("optimizer", {})
 
+    # get subset length and indices
     subset_len = max(1, int(len(dataset) * fraction))
     indices = list(range(len(dataset)))
     random_seed = int(train_cfg.get("seed", dataset_cfg.get("seed", 0)))
     random.seed(random_seed)
     if isinstance(policy_cfg, VPTPolicyConfig):
-        # Shuffle at the video level while preserving chronological ordering inside each video.
+        # Shuffle at the video level while preserving chronological ordering per video
         video_to_indices: Dict[int, List[int]] = {}
         for idx, (_, _, _, vid) in enumerate(dataset.samples):
             video_to_indices.setdefault(int(vid), []).append(idx)
@@ -311,13 +158,24 @@ def train_initial_bc(
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
 
+    # load in training parameters
     train_batch_size = batch_size
     train_epochs = epochs
     train_workers = int(train_cfg.get("num_workers", 4))
     val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
     checkpoint_interval = int(train_cfg.get("checkpoint_interval", 0))
+    camera_gate_weight = float(train_cfg.get("camera_gate_weight", 1.0))
+    grad_clip_norm_raw = train_cfg.get("grad_clip_norm", 1.0)
+    grad_clip_norm: Optional[float]
+    try:
+        grad_clip_norm = float(grad_clip_norm_raw)
+    except (TypeError, ValueError):
+        grad_clip_norm = None
+    if grad_clip_norm is not None and grad_clip_norm <= 0:
+        grad_clip_norm = None
 
+    # initialize wandb
     wandb.init(
         project="foundation-dagger",
         job_type="bc-bootstrap",
@@ -336,9 +194,12 @@ def train_initial_bc(
             "policy_output_dim": policy_cfg.action_dim,
             "train_samples": len(train_subset),
             "val_samples": len(val_subset),
+            "camera_gate_weight": camera_gate_weight,
+            "grad_clip_norm": grad_clip_norm if grad_clip_norm is not None else 0.0,
         },
     )
 
+    # initialize data loader
     use_memory = isinstance(policy_cfg, VPTPolicyConfig)
     prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
     loader_kwargs = dict(
@@ -352,6 +213,7 @@ def train_initial_bc(
         loader_kwargs["prefetch_factor"] = max(prefetch_factor, 1)
     loader = DataLoader(train_subset, **loader_kwargs)
 
+    # initialize model
     model = build_policy(policy_cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -372,7 +234,6 @@ def train_initial_bc(
         betas=tuple(opt_cfg.get("betas", [0.9, 0.99])),
         weight_decay=float(opt_cfg.get("weight_decay", 1e-4)),
     )
-    criterion = nn.CrossEntropyLoss()
 
     val_prefetch_factor = int(train_cfg.get("val_prefetch_factor", prefetch_factor))
     val_loader_kwargs = dict(
@@ -386,10 +247,19 @@ def train_initial_bc(
         val_loader_kwargs["prefetch_factor"] = max(val_prefetch_factor, 1)
     val_loader = DataLoader(val_subset, **val_loader_kwargs)
 
+    mem_limit: Optional[int] = None
+    if isinstance(policy_cfg, VPTPolicyConfig) and policy_cfg.mem_len > 0:
+        mem_limit = int(policy_cfg.mem_len)
+
+    cam_idx0, cam_idx1 = camera_token_indices
+    cam_center0, cam_center1 = camera_center_tokens
+
     def run_epoch(data_loader, train: bool):
         running_loss = 0.0
-        running_acc = 0.0
-        count = 0
+        running_correct = 0.0
+        running_tokens = 0
+        running_gate_loss = 0.0
+        running_gate_examples = 0
         if train:
             model.train()
         else:
@@ -422,6 +292,7 @@ def train_initial_bc(
             with torch.set_grad_enabled(train):
                 if use_transformer:
                     batch_logits: list[torch.Tensor] = []
+                    batch_gate_logits: list[torch.Tensor] = []
                     for sample_idx in range(observations.size(0)):
                         vid = int(video_ids_list[sample_idx]) if video_ids_list is not None else sample_idx
                         frame_idx = int(frame_indices_list[sample_idx]) if frame_indices_list is not None else -1
@@ -429,69 +300,163 @@ def train_initial_bc(
                         last_idx = last_frame_index.get(vid)
                         if last_idx is None or frame_idx != last_idx + 1:
                             mem = None
-                        logits_i, new_mem = model(
+                        logits_i, gate_logit_i, new_mem = model(
                             observations[sample_idx : sample_idx + 1],
                             mems=mem,
                             return_mems=True,
+                            return_gate=True,
                         )
-                        mem_bank[vid] = new_mem
+                        if not torch.isfinite(logits_i).all():
+                            # Reset memory and retry once with a clean cache.
+                            logits_i, gate_logit_i, new_mem = model(
+                                observations[sample_idx : sample_idx + 1],
+                                mems=None,
+                                return_mems=True,
+                                return_gate=True,
+                            )
+                            mem = None
+                        if not torch.isfinite(logits_i).all():
+                            print("Non-finite logits even after resetting memory. Diagnostics:")
+                            print(f"  video_id={vid} frame_idx={frame_idx}")
+                            raise ValueError("Transformer produced non-finite logits.")
+                        if new_mem is not None:
+                            trimmed_mem: list[Optional[torch.Tensor]] = []
+                            for layer_mem in new_mem:
+                                if layer_mem is None:
+                                    trimmed_mem.append(None)
+                                else:
+                                    if mem_limit is not None and layer_mem.size(1) > mem_limit:
+                                        layer_mem = layer_mem[:, -mem_limit:, :]
+                                    trimmed_mem.append(layer_mem.detach())
+                            mem_bank[vid] = trimmed_mem
+                        else:
+                            mem_bank[vid] = None
                         last_frame_index[vid] = frame_idx
                         batch_logits.append(logits_i)
+                        batch_gate_logits.append(gate_logit_i)
                     logits = torch.cat(batch_logits, dim=0)
+                    gate_logits = torch.cat(batch_gate_logits, dim=0)
                 else:
-                    logits = model(observations)
-                logits = logits.view(observations.size(0), action_length, action_vocab_size)
-                loss = criterion(logits.view(-1, action_vocab_size), labels.view(-1))
-                if train:
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-            running_loss += loss.item() * observations.size(0)
+                    logits, gate_logits = model(observations, return_gate=True)
+            logits = logits.view(observations.size(0), action_length, action_vocab_size)
+            effective_labels = labels.clone()
+            gate_targets = (
+                (labels[:, cam_idx0] != cam_center0)
+                | (labels[:, cam_idx1] != cam_center1)
+            ).float()
+            invalid_camera = (
+                (labels[:, cam_idx0] == IGNORE_INDEX)
+                | (labels[:, cam_idx1] == IGNORE_INDEX)
+            )
+            gate_targets = gate_targets.masked_fill(invalid_camera, 0.0)
+            no_camera_mask = gate_targets == 0
+            effective_labels = effective_labels.clone()
+            effective_labels[no_camera_mask, cam_idx0] = IGNORE_INDEX
+            effective_labels[no_camera_mask, cam_idx1] = IGNORE_INDEX
+            flat_logits = logits.view(-1, action_vocab_size)
+            flat_labels = effective_labels.view(-1)
+            loss_per_token = F.cross_entropy(
+                flat_logits,
+                flat_labels,
+                ignore_index=IGNORE_INDEX,
+                reduction="none",
+            )
+            valid_mask = flat_labels != IGNORE_INDEX
+            if not torch.any(valid_mask):
+                continue
+            token_loss = loss_per_token[valid_mask].mean()
+            gate_loss = F.binary_cross_entropy_with_logits(
+                gate_logits,
+                gate_targets,
+            )
+            total_loss = token_loss + camera_gate_weight * gate_loss
+            if train:
+                optimizer.zero_grad()
+                total_loss.backward()
+                if grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                optimizer.step()
+            running_gate_loss += gate_loss.item() * gate_logits.numel()
+            running_gate_examples += gate_logits.numel()
+            valid_mask_matrix = effective_labels != IGNORE_INDEX
+            running_loss += loss_per_token[valid_mask].sum().item()
+            valid_tokens = valid_mask_matrix.sum().item()
+            running_tokens += valid_tokens
             preds = logits.argmax(dim=-1)
-            token_acc = (preds == labels).float().mean(dim=1)
-            running_acc += token_acc.sum().item()
-            count += observations.size(0)
+            correct_tokens = ((preds == effective_labels) & valid_mask_matrix).sum().item()
+            running_correct += correct_tokens
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print("Detected invalid logits in batch. Dumping diagnostics:")
+                print(f"  video_ids={video_ids_list}")
+                print(f"  frame_indices={frame_indices_list}")
+                print(f"  logits_finite={torch.isfinite(logits).all().item()}")
+                finite_vals = logits[torch.isfinite(logits)]
+                if finite_vals.numel() > 0:
+                    print(f"  logits_min={finite_vals.min().item()}  logits_max={finite_vals.max().item()}")
+                else:
+                    print("  logits_min=nan  logits_max=nan (no finite values)")
+                raise ValueError("Encountered NaN or Inf in logits during training.")
+            if torch.isnan(total_loss):
+                print("Detected NaN loss. Dumping diagnostics:")
+                print(f"  video_ids={video_ids_list}")
+                print(f"  frame_indices={frame_indices_list}")
+                print(f"  token_loss={token_loss}")
+                print(f"  gate_loss={gate_loss}")
+                print(f"  logits_nan={torch.isnan(logits).any().item()}")
+                print(f"  labels={labels[:3].detach().cpu().tolist()}")
+                raise ValueError("Loss became NaN.")
             if not train and len(sample_outputs) < 3:
                 max_samples = min(observations.size(0), 3 - len(sample_outputs))
                 for sample_idx in range(max_samples):
                     sample_outputs.append(
                         (
-                            labels[sample_idx].detach().cpu().view(-1).tolist(),
+                            effective_labels[sample_idx].detach().cpu().view(-1).tolist(),
                             preds[sample_idx].detach().cpu().view(-1).tolist(),
                         )
                     )
-            if count > 0:
+            if running_tokens > 0:
                 iterator.set_postfix(
-                    loss=f"{running_loss / count:.4f}",
-                    acc=f"{running_acc / count:.4f}",
+                    loss=f"{running_loss / running_tokens:.4f}",
+                    acc=f"{running_correct / running_tokens:.4f}",
                 )
-        if count == 0:
-            return 0.0, 0.0, sample_outputs
-        return running_loss / count, running_acc / count, sample_outputs
+        gate_loss_avg = running_gate_loss / running_gate_examples if running_gate_examples > 0 else 0.0
+        info = {"samples": sample_outputs, "gate_loss": gate_loss_avg}
+        if running_tokens == 0:
+            return 0.0, 0.0, info
+        return running_loss / running_tokens, running_correct / running_tokens, info
 
     for epoch in range(train_epochs):
-        train_loss, train_acc, _ = run_epoch(loader, train=True)
+        train_loss, train_acc, train_info = run_epoch(loader, train=True)
         if len(val_subset) > 0:
-            val_loss, val_acc, val_samples = run_epoch(val_loader, train=False)
+            val_loss, val_acc, val_info = run_epoch(val_loader, train=False)
         else:
-            val_loss, val_acc, val_samples = None, None, []
-        metrics = {"train/loss": train_loss, "train/acc": train_acc}
+            val_loss, val_acc, val_info = None, None, {"samples": [], "gate_loss": 0.0}
+        metrics = {
+            "train/loss": train_loss,
+            "train/acc": train_acc,
+            "train/gate_loss": train_info.get("gate_loss", 0.0),
+        }
         if val_loss is not None:
             metrics["val/loss"] = val_loss
             metrics["val/acc"] = val_acc
+            metrics["val/gate_loss"] = val_info.get("gate_loss", 0.0)
         wandb.log(metrics, step=epoch + 1)
         if val_loss is not None:
             print(
                 f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f} "
-                f"- val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f}"
+                f"- gate_loss: {train_info.get('gate_loss', 0.0):.4f} "
+                f"- val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f} "
+                f"- val_gate_loss: {val_info.get('gate_loss', 0.0):.4f}"
             )
+            val_samples = val_info.get("samples", [])
             if val_samples:
                 print("Validation samples (target vs. prediction):")
                 for idx, (target_tokens, pred_tokens) in enumerate(val_samples, start=1):
                     print(f"  Sample {idx}: target={target_tokens} pred={pred_tokens}")
         else:
             print(
-                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f}"
+                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f} "
+                f"- gate_loss: {train_info.get('gate_loss', 0.0):.4f}"
             )
         if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
             ckpt_path = save_checkpoint(f"epoch{epoch + 1:03d}")
