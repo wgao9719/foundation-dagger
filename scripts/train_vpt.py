@@ -196,8 +196,18 @@ def train_vpt_bc(
 
     # initialize weights
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    path = "/workspace/foundation-dagger/foundation-dagger/checkpoints/vpt/foundation-model-1x.weights"
-    model.load_state_dict(torch.load(path, map_location=device), strict=False)
+    path = "/Users/willi1/foundation-dagger/diffusion-forcing-transformer/checkpoints/vpt/foundation-model-1x.weights"
+    # path = "/workspace/foundation-dagger/foundation-dagger/checkpoints/vpt/foundation-model-1x.weights"
+    # model.load_state_dict(torch.load(path, map_location=device), strict=False)
+    state_dict = torch.load(path, map_location=device)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys or unexpected_keys:
+        warn_lines = ["VPT checkpoint load was non-strict:"]
+        if missing_keys:
+            warn_lines.append(f"  missing keys ({len(missing_keys)}): {sorted(missing_keys)[:10]}{' ...' if len(missing_keys) > 10 else ''}")
+        if unexpected_keys:
+            warn_lines.append(f"  unexpected keys ({len(unexpected_keys)}): {sorted(unexpected_keys)[:10]}{' ...' if len(unexpected_keys) > 10 else ''}")
+        print("\n".join(warn_lines))
     model = model.to(device)
 
     def _move_state_to_device(state):
