@@ -55,6 +55,10 @@ from algorithms.foundation_dagger.policy import (
     parse_policy_config,
 )
 
+from algorithms.foundation_dagger.vpt_model.policy import MinecraftAgentPolicy
+from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
+from algorithms.foundation_dagger.vpt_model.load_vpt_config import VPTConfig, parse_policy_config
+
 IGNORE_INDEX = -100
 
 
@@ -92,19 +96,13 @@ def train_initial_bc(
     output: Path,
     dataset_cfg: Dict,
     policy_cfg_dict: Dict,
+    algorithm_name: str,
+    experiment_name: str,
     dataset_name: str,
     exp_cfg: Dict,
 ) -> None:
     # get configs
-    policy_cfg: BasePolicyConfig = parse_policy_config(policy_cfg_dict)
-    action_keys_cfg = dataset_cfg.get("action_keys")
-    if action_keys_cfg:
-        policy_cfg.action_dim = len(action_keys_cfg)
-    else:
-        action_keys_cfg = None
-    action_classes = dataset_cfg.get("action_classes")
-    if action_classes is not None:
-        policy_cfg.action_dim = int(action_classes)
+    policy_cfg: VPTConfig = parse_policy_config(policy_cfg_dict)
 
     #initialize dataset
     dataset = MineWorldFrameDataset(
@@ -119,7 +117,6 @@ def train_initial_bc(
     # get action length and vocabulary size
     action_length = dataset.action_length
     action_vocab_size = dataset.action_vocab_size
-    policy_cfg.action_dim = action_vocab_size * action_length
 
     train_cfg = exp_cfg.get("training", {})
     opt_cfg = exp_cfg.get("optimizer", {})
@@ -131,18 +128,16 @@ def train_initial_bc(
     random.seed(random_seed)
 
     # Shuffle at the video level while preserving chronological ordering per video.
-    if isinstance(policy_cfg, VPTPolicyConfig):
-        video_to_indices: Dict[int, List[int]] = {}
-        for idx, (_, _, _, vid) in enumerate(dataset.samples):
-            video_to_indices.setdefault(int(vid), []).append(idx)
-        video_ids = list(video_to_indices.keys())
-        random.shuffle(video_ids)
-        indices = []
-        for vid in video_ids:
-            indices.extend(video_to_indices[vid])
-    else:
-        random.shuffle(indices)
+    video_to_indices: Dict[int, List[int]] = {}
+    for idx, (_, _, _, vid) in enumerate(dataset.samples):
+        video_to_indices.setdefault(int(vid), []).append(idx)
+    video_ids = list(video_to_indices.keys())
+    random.shuffle(video_ids)
+    indices = []
+    for vid in video_ids:
+        indices.extend(video_to_indices[vid])
 
+    # split dataset into training and validation
     val_fraction = float(train_cfg.get("val_fraction", dataset_cfg.get("val_fraction", 0.1)))
     if subset_len <= 1 or val_fraction <= 0:
         val_fraction = 0.0
@@ -151,15 +146,12 @@ def train_initial_bc(
         val_split = max(1, int(round(subset_len * val_fraction)))
         if val_split >= subset_len:
             val_split = max(1, subset_len - 1)
-    val_indices = indices[:val_split]
-    train_indices = indices[val_split:subset_len]
-    if isinstance(policy_cfg, VPTPolicyConfig):
-        val_indices = sorted(val_indices)
-        train_indices = sorted(train_indices)
+    val_indices = sorted(indices[:val_split])
+    train_indices = sorted(indices[val_split:subset_len])
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
 
-    # load in training parameters
+    # load in training hparameters
     train_batch_size = batch_size
     train_epochs = epochs
     train_workers = int(train_cfg.get("num_workers", 4))
@@ -182,6 +174,8 @@ def train_initial_bc(
         job_type="bc-bootstrap",
         config={
             "dataset": dataset_name,
+            "algorithm": algorithm_name,
+            "experiment": experiment_name,
             "data_root": str(data_root),
             "fraction": fraction,
             "epochs": train_epochs,
@@ -215,7 +209,10 @@ def train_initial_bc(
     loader = DataLoader(train_subset, **loader_kwargs)
 
     # initialize model
-    model = build_policy(policy_cfg)
+    action_space = CameraHierarchicalMapping(n_camera_bins=11)
+    policy_kwargs = policy_cfg.model.args.net.args
+    pi_head_kwargs = policy_cfg.model.pi_head_opts
+    model = MinecraftAgentPolicy(action_space,policy_kwargs, pi_head_kwargs)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
@@ -248,10 +245,6 @@ def train_initial_bc(
         val_loader_kwargs["prefetch_factor"] = max(val_prefetch_factor, 1)
     val_loader = DataLoader(val_subset, **val_loader_kwargs)
 
-    mem_limit: Optional[int] = None
-    if isinstance(policy_cfg, VPTPolicyConfig) and policy_cfg.mem_len > 0:
-        mem_limit = int(policy_cfg.mem_len)
-
     cam_idx0, cam_idx1 = camera_token_indices
     cam_center0, cam_center1 = camera_center_tokens
 
@@ -265,9 +258,6 @@ def train_initial_bc(
             model.train()
         else:
             model.eval()
-        use_transformer = isinstance(model, VPTCausalPolicy)
-        mem_bank: dict[int, Optional[Sequence[torch.Tensor]]] = {} if use_transformer else {}
-        last_frame_index: dict[int, int] = {} if use_transformer else {}
         sample_outputs: list[tuple[list[int], list[int]]] = []
         iterator = tqdm(
             data_loader,
@@ -291,54 +281,20 @@ def train_initial_bc(
                 video_ids_list = None
                 frame_indices_list = None
             with torch.set_grad_enabled(train):
-                if use_transformer:
-                    batch_logits: list[torch.Tensor] = []
-                    batch_gate_logits: list[torch.Tensor] = []
-                    for sample_idx in range(observations.size(0)):
-                        vid = int(video_ids_list[sample_idx]) if video_ids_list is not None else sample_idx
-                        frame_idx = int(frame_indices_list[sample_idx]) if frame_indices_list is not None else -1
-                        mem = mem_bank.get(vid)
-                        last_idx = last_frame_index.get(vid)
-                        if last_idx is None or frame_idx != last_idx + 1:
-                            mem = None
-                        logits_i, gate_logit_i, new_mem = model(
-                            observations[sample_idx : sample_idx + 1],
-                            mems=mem,
-                            return_mems=True,
-                            return_gate=True,
-                        )
-                        if not torch.isfinite(logits_i).all():
-                            # Reset memory and retry once with a clean cache.
-                            logits_i, gate_logit_i, new_mem = model(
-                                observations[sample_idx : sample_idx + 1],
-                                mems=None,
-                                return_mems=True,
-                                return_gate=True,
-                            )
-                            mem = None
-                        if not torch.isfinite(logits_i).all():
-                            print("Non-finite logits even after resetting memory. Diagnostics:")
-                            print(f"  video_id={vid} frame_idx={frame_idx}")
-                            raise ValueError("Transformer produced non-finite logits.")
-                        if new_mem is not None:
-                            trimmed_mem: list[Optional[torch.Tensor]] = []
-                            for layer_mem in new_mem:
-                                if layer_mem is None:
-                                    trimmed_mem.append(None)
-                                else:
-                                    if mem_limit is not None and layer_mem.size(1) > mem_limit:
-                                        layer_mem = layer_mem[:, -mem_limit:, :]
-                                    trimmed_mem.append(layer_mem.detach())
-                            mem_bank[vid] = trimmed_mem
-                        else:
-                            mem_bank[vid] = None
-                        last_frame_index[vid] = frame_idx
-                        batch_logits.append(logits_i)
-                        batch_gate_logits.append(gate_logit_i)
-                    logits = torch.cat(batch_logits, dim=0)
-                    gate_logits = torch.cat(batch_gate_logits, dim=0)
-                else:
-                    logits, gate_logits = model(observations, return_gate=True)
+                batch_logits: list[torch.Tensor] = []
+                batch_gate_logits: list[torch.Tensor] = []
+                for sample_idx in range(observations.size(0)):
+                    vid = int(video_ids_list[sample_idx]) if video_ids_list is not None else sample_idx
+                    frame_idx = int(frame_indices_list[sample_idx]) if frame_indices_list is not None else -1
+                    logits_i, gate_logit_i, new_mem = model(
+                        observations[sample_idx : sample_idx + 1],
+                        return_gate=True,
+                    )
+                    batch_logits.append(logits_i)
+                    batch_gate_logits.append(gate_logit_i)
+                logits = torch.cat(batch_logits, dim=0)
+                gate_logits = torch.cat(batch_gate_logits, dim=0)
+
             logits = logits.view(observations.size(0), action_length, action_vocab_size)
             effective_labels = labels.clone()
             gate_targets = (
@@ -386,26 +342,7 @@ def train_initial_bc(
             preds = logits.argmax(dim=-1)
             correct_tokens = ((preds == effective_labels) & valid_mask_matrix).sum().item()
             running_correct += correct_tokens
-            if torch.isnan(logits).any() or torch.isinf(logits).any():
-                print("Detected invalid logits in batch. Dumping diagnostics:")
-                print(f"  video_ids={video_ids_list}")
-                print(f"  frame_indices={frame_indices_list}")
-                print(f"  logits_finite={torch.isfinite(logits).all().item()}")
-                finite_vals = logits[torch.isfinite(logits)]
-                if finite_vals.numel() > 0:
-                    print(f"  logits_min={finite_vals.min().item()}  logits_max={finite_vals.max().item()}")
-                else:
-                    print("  logits_min=nan  logits_max=nan (no finite values)")
-                raise ValueError("Encountered NaN or Inf in logits during training.")
-            if torch.isnan(total_loss):
-                print("Detected NaN loss. Dumping diagnostics:")
-                print(f"  video_ids={video_ids_list}")
-                print(f"  frame_indices={frame_indices_list}")
-                print(f"  token_loss={token_loss}")
-                print(f"  gate_loss={gate_loss}")
-                print(f"  logits_nan={torch.isnan(logits).any().item()}")
-                print(f"  labels={labels[:3].detach().cpu().tolist()}")
-                raise ValueError("Loss became NaN.")
+            # sample validation outputs
             if not train and len(sample_outputs) < 3:
                 max_samples = min(observations.size(0), 3 - len(sample_outputs))
                 for sample_idx in range(max_samples):
@@ -471,10 +408,22 @@ def train_initial_bc(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--algorithm",
+        type=str,
+        default="vpt_bc",
+        help="Hydra algorithm config name.",
+    )
+    parser.add_argument(
         "--dataset",
         type=str,
         default="mineworld_frames",
         help="Hydra dataset config name.",
+    )
+    parser.add_argument(
+        "--experiment",
+        type=str,
+        default="mineworld_bc_train",
+        help="Hydra experiment config name.",
     )
     parser.add_argument(
         "--data-root",
@@ -528,10 +477,13 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    
     dataset_cfg, policy_cfg_dict, exp_cfg = _load_hydra_configs(
-        dataset_name=args.dataset, algorithm_name='mineworld_bc', experiment_name='mineworld_bc_train'
+        dataset_name=args.dataset, algorithm_name=args.algorithm, experiment_name=args.experiment
     )
+    algorithm_name = args.algorithm or policy_cfg_dict.get("name", "vpt_bc")
     dataset_name = args.dataset or dataset_cfg.get("name", "mineworld_frames")
+    experiment_name = args.experiment or exp_cfg.get("name", "mineworld_bc_train")
 
     data_root_value = args.data_root or dataset_cfg.get("data_root")
     if data_root_value is None:
@@ -585,6 +537,8 @@ if __name__ == "__main__":
         output=output,
         dataset_cfg=dataset_cfg,
         policy_cfg_dict=policy_cfg_dict,
+        algorithm_name=algorithm_name,
+        experiment_name=experiment_name,
         dataset_name=dataset_name,
         exp_cfg=exp_cfg,
     )

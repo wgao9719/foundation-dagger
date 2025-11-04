@@ -8,9 +8,9 @@ import torch as th
 from torch import nn
 from torch.nn import functional as F
 
-from lib import misc, mlp
-from lib import torch_util as tu
-from lib import util
+from algorithms.foundation_dagger.vpt_model import misc, mlp
+from algorithms.foundation_dagger.vpt_model import torch_util as tu
+from algorithms.foundation_dagger.vpt_model import util
 
 SENTINEL = 0.1337
 

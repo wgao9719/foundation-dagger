@@ -3,9 +3,9 @@ import functools
 import torch as th
 from torch import nn
 
-import lib.xf as xf
-from lib.minecraft_util import store_args
-from lib.tree_util import tree_map
+import algorithms.foundation_dagger.vpt_model.xf as xf
+from algorithms.foundation_dagger.vpt_model.minecraft_util import store_args
+from algorithms.foundation_dagger.vpt_model.tree_util import tree_map
 
 
 @functools.lru_cache()

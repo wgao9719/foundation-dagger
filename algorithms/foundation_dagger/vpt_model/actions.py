@@ -2,7 +2,7 @@ import attr
 import minerl.herobraine.hero.mc as mc
 import numpy as np
 
-from lib.minecraft_util import store_args
+from algorithms.foundation_dagger.vpt_model.minecraft_util import store_args
 
 
 class Buttons:
