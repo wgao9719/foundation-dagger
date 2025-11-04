@@ -8,14 +8,14 @@ from gym3.types import DictType
 from torch import nn
 from torch.nn import functional as F
 
-from lib.action_head import make_action_head
-from lib.action_mapping import CameraHierarchicalMapping
-from lib.impala_cnn import ImpalaCNN
-from lib.normalize_ewma import NormalizeEwma
-from lib.scaled_mse_head import ScaledMSEHead
-from lib.tree_util import tree_map
-from lib.util import FanInInitReLULayer, ResidualRecurrentBlocks
-from lib.misc import transpose
+from algorithms.foundation_dagger.vpt_model.action_head import make_action_head
+from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
+from algorithms.foundation_dagger.vpt_model.impala_cnn import ImpalaCNN
+from algorithms.foundation_dagger.vpt_model.normalize_ewma import NormalizeEwma
+from algorithms.foundation_dagger.vpt_model.scaled_mse_head import ScaledMSEHead
+from algorithms.foundation_dagger.vpt_model.tree_util import tree_map
+from algorithms.foundation_dagger.vpt_model.util import FanInInitReLULayer, ResidualRecurrentBlocks
+from algorithms.foundation_dagger.vpt_model.misc import transpose
 
 
 class ImgPreprocessing(nn.Module):
