@@ -9,7 +9,7 @@ from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarch
 from algorithms.foundation_dagger.vpt_model.actions import ActionTransformer
 from algorithms.foundation_dagger.vpt_model.policy import InverseActionPolicy
 from algorithms.foundation_dagger.vpt_model.torch_util import default_device_type, set_default_torch_device
-from agent import resize_image, AGENT_RESOLUTION
+from evaluation.agent import resize_image, AGENT_RESOLUTION
 
 
 ACTION_TRANSFORMER_KWARGS = dict(

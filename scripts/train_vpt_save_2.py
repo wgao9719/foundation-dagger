@@ -11,21 +11,17 @@ samples is used to keep the bootstrap stage quick.
 
 Example
 -------
-python -m scripts.train_vpt \
-  --algorithm vpt_bc
-  --dataset mineworld_frames \
-  --experiment mineworld_bc_train \
-  --data-root /workspace/foundation-dagger/foundation-dagger/data/mineworld \
-  --fraction 0.3 \
-  --epochs 20 \
-  --batch-size 32 \
-  --output checkpoints/bc_checkpoints/bc_policy.ckpt
+python scripts/train_initial_bc.py \
+    --dataset mineworld_frames \
+    --data-root /Users/willi1/foundation-dagger/diffusion-forcing-transformer/data/mineworld \
+    --fraction 0.1 \
+    --epochs 10 \
+    --batch-size 32 \
+    --output checkpoints/bc_policy.ckpt
 """
 
 
 from __future__ import annotations
-
-#train:   3%|▌                    | 91/3424 [02:49<22:38,  2.45it/s, loss=7.2887]
 
 import argparse
 import random
@@ -36,7 +32,6 @@ from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
 from typing import Dict, List, Optional
-from gym3.types import DictType
 
 import torch
 from torch import nn
@@ -80,7 +75,7 @@ def _load_hydra_configs(
     exp_cfg = OmegaConf.to_container(cfg.experiment, resolve=True)
     return dataset_cfg, policy_cfg, exp_cfg
 
-def train_vpt_bc(
+def train_initial_bc(
     data_root: Path,
     fraction: float,
     epochs: int,
@@ -164,6 +159,7 @@ def train_vpt_bc(
             "resize": resize,
             "val_fraction": val_fraction,
             "seed": random_seed,
+            "policy_output_dim": policy_cfg.action_dim,
             "train_samples": len(train_subset),
             "val_samples": len(val_subset),
             "grad_clip_norm": grad_clip_norm if grad_clip_norm is not None else 0.0,
@@ -184,20 +180,14 @@ def train_vpt_bc(
     loader = DataLoader(train_subset, **loader_kwargs)
 
     # initialize model
-    action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
-    action_space = action_mapper.get_action_space_update()
-    action_space = DictType(**action_space)
-
-    model_args = policy_cfg.model.get("args", {})
-    policy_kwargs = model_args.get("net", {}).get("args", {})
-    pi_head_kwargs = model_args.get("pi_head_opts", {})
-
+    action_space = CameraHierarchicalMapping(n_camera_bins=11)
+    policy_kwargs = policy_cfg.model.args.net.args
+    pi_head_kwargs = policy_cfg.model.pi_head_opts
     model = MinecraftAgentPolicy(action_space, policy_kwargs, pi_head_kwargs)
-
     # initialize weights
+    weights = "/Users/willi1/foundation-dagger/diffusion-forcing-transformer/checkpoints/vpt/foundation-model-1x.weights"
+    model.load_weights(weights)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    path = "/workspace/foundation-dagger/foundation-dagger/checkpoints/vpt/foundation-model-1x.weights"
-    model.load_state_dict(torch.load(path, map_location=device), strict=False)
     model = model.to(device)
 
     def _move_state_to_device(state):
@@ -243,9 +233,12 @@ def train_vpt_bc(
             model.train()
         else:
             model.eval()
-
-        iterator = tqdm(data_loader, desc="train" if train else "val", leave=False, ncols=80)
-
+        iterator = tqdm(
+            data_loader,
+            desc="train" if train else "val",
+            leave=False,
+            ncols=80,
+        )
         for batch in iterator:
             observations, _, video_ids, frame_indices = batch
             observations = observations.to(device, non_blocking=True).contiguous()
@@ -261,10 +254,9 @@ def train_vpt_bc(
                 for key in action_keys
             }
             batch_size = observations.size(0)
-            seq_len = observations.size(1) if observations.dim() >= 2 else 1
             with torch.set_grad_enabled(train):
                 state_in = _move_state_to_device(model.initial_state(batch_size))
-                first = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+                first = torch.zeros(batch_size, dtype=torch.bool, device=device)
                 obs_dict = {"img": observations}
                 policy_tuple, _ = model(obs_dict, first, state_in)
                 pd_params = policy_tuple[0]
@@ -436,7 +428,7 @@ if __name__ == "__main__":
     if args.no_recursive:
         recursive = False
 
-    train_vpt_bc(
+    train_initial_bc(
         data_root=data_root,
         fraction=fraction,
         epochs=epochs,
