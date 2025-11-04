@@ -262,9 +262,14 @@ class RelMultiHeadAttention(nn.Module):
         attn_score = (AC + BD) * self.scale
 
         if attn_mask is not None:
-            attn_score = attn_score.masked_fill(attn_mask, float("-inf"))
+            finfo = torch.finfo(attn_score.dtype)
+            attn_score = attn_score.masked_fill(attn_mask, finfo.min)
+            full_mask = attn_mask.all(dim=-1, keepdim=True)
+            if full_mask.any():
+                attn_score = attn_score.masked_fill(full_mask, 0.0)
 
         attn_prob = torch.softmax(attn_score, dim=-1)
+        attn_prob = torch.nan_to_num(attn_prob, nan=0.0, posinf=0.0, neginf=0.0)
         attn_prob = self.attn_dropout(attn_prob)
 
         attn_vec = torch.einsum("bnqk,bnkd->bnqd", attn_prob, w_head_v)
@@ -343,7 +348,8 @@ class TransformerXLBlock(nn.Module):
     ) -> Optional[torch.Tensor]:
         if self.mem_len <= 0:
             return None
-        new_mem = hidden.detach()
+        sanitized_hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
+        new_mem = sanitized_hidden.detach()
         if new_mem.size(1) > self.mem_len:
             new_mem = new_mem[:, -self.mem_len :, :]
         if mem is None:

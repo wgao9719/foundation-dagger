@@ -35,3 +35,4 @@ pytubefix
 roma
 transformers
 minerl
+gym3
