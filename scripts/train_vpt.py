@@ -53,9 +53,9 @@ from algorithms.foundation_dagger.vpt_model.load_vpt_config import VPTConfig, pa
 
 
 def _load_hydra_configs(
-    dataset_name: str = "mineworld_frames",
-    algorithm_name: str = "mineworld_bc",
-    experiment_name: str = "mineworld_bc_train"
+    dataset_name: str,
+    algorithm_name: str,
+    experiment_name: str,
 ) -> tuple[dict, dict, dict]:
     overrides: list[str] = []
     if dataset_name:

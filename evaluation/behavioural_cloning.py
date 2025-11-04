@@ -19,8 +19,8 @@ import minerl
 import torch as th
 import numpy as np
 
-from agent import PI_HEAD_KWARGS, MineRLAgent
-from data_loader import DataLoader
+from evaluation.agent import PI_HEAD_KWARGS, MineRLAgent
+from evaluation.data_loader import DataLoader
 from algorithms.foundation_dagger.vpt_model.tree_util import tree_map
 
 EPOCHS = 2

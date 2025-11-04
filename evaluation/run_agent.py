@@ -4,7 +4,7 @@ import pickle
 import minerl
 from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
 
-from agent import MineRLAgent, ENV_KWARGS
+from evaluation.agent import MineRLAgent, ENV_KWARGS
 
 def main(model, weights):
     #env = HumanSurvival(**ENV_KWARGS).make()
@@ -22,6 +22,7 @@ def main(model, weights):
 
     while True:
         minerl_action = agent.get_action(obs)
+        minerl_action["ESC"] = 0
         obs, reward, done, info = env.step(minerl_action)
         env.render()
 
