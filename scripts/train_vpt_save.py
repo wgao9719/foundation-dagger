@@ -47,14 +47,6 @@ from datasets.mineworld_data.mineworld_frame_dataset import MineWorldFrameDatase
 
 CONFIG_DIR = ROOT_DIR / "configurations"
 
-from algorithms.foundation_dagger.policy import (
-    BasePolicyConfig,
-    VPTCausalPolicy,
-    VPTPolicyConfig,
-    build_policy,
-    parse_policy_config,
-)
-
 from algorithms.foundation_dagger.vpt_model.policy import MinecraftAgentPolicy
 from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
 from algorithms.foundation_dagger.vpt_model.load_vpt_config import VPTConfig, parse_policy_config
@@ -108,15 +100,9 @@ def train_initial_bc(
     dataset = MineWorldFrameDataset(
         data_root=data_root,
         context_frames=context_frames,
-        resize=resize,
         recursive=recursive,
         max_open_captures=int(dataset_cfg.get("max_open_captures", 2)),
     )
-    camera_token_indices = dataset.camera_token_indices
-    camera_center_tokens = dataset.camera_center_tokens
-    # get action length and vocabulary size
-    action_length = dataset.action_length
-    action_vocab_size = dataset.action_vocab_size
 
     train_cfg = exp_cfg.get("training", {})
     opt_cfg = exp_cfg.get("optimizer", {})
@@ -129,7 +115,7 @@ def train_initial_bc(
 
     # Shuffle at the video level while preserving chronological ordering per video.
     video_to_indices: Dict[int, List[int]] = {}
-    for idx, (_, _, _, vid) in enumerate(dataset.samples):
+    for idx, (_, vid, _) in enumerate(dataset.samples):
         video_to_indices.setdefault(int(vid), []).append(idx)
     video_ids = list(video_to_indices.keys())
     random.shuffle(video_ids)
@@ -158,7 +144,6 @@ def train_initial_bc(
     val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
     checkpoint_interval = int(train_cfg.get("checkpoint_interval", 0))
-    camera_gate_weight = float(train_cfg.get("camera_gate_weight", 1.0))
     grad_clip_norm_raw = train_cfg.get("grad_clip_norm", 1.0)
     grad_clip_norm: Optional[float]
     try:
@@ -184,22 +169,18 @@ def train_initial_bc(
             "resize": resize,
             "val_fraction": val_fraction,
             "seed": random_seed,
-            "action_vocab_size": action_vocab_size,
-            "action_length": action_length,
             "policy_output_dim": policy_cfg.action_dim,
             "train_samples": len(train_subset),
             "val_samples": len(val_subset),
-            "camera_gate_weight": camera_gate_weight,
             "grad_clip_norm": grad_clip_norm if grad_clip_norm is not None else 0.0,
         },
     )
 
     # initialize data loader
-    use_memory = isinstance(policy_cfg, VPTPolicyConfig)
     prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
     loader_kwargs = dict(
         batch_size=train_batch_size,
-        shuffle=not use_memory,
+        shuffle=False,
         num_workers=train_workers,
         pin_memory=True,
         persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
@@ -215,6 +196,13 @@ def train_initial_bc(
     model = MinecraftAgentPolicy(action_space,policy_kwargs, pi_head_kwargs)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+
+    def _move_state_to_device(state):
+        if state is None:
+            return None
+        if isinstance(state, (list, tuple)):
+            return type(state)(_move_state_to_device(s) for s in state)
+        return state.to(device, non_blocking=True)
 
     def save_checkpoint(suffix: str | None = None) -> Path:
         if suffix:
@@ -245,20 +233,13 @@ def train_initial_bc(
         val_loader_kwargs["prefetch_factor"] = max(val_prefetch_factor, 1)
     val_loader = DataLoader(val_subset, **val_loader_kwargs)
 
-    cam_idx0, cam_idx1 = camera_token_indices
-    cam_center0, cam_center1 = camera_center_tokens
-
     def run_epoch(data_loader, train: bool):
         running_loss = 0.0
-        running_correct = 0.0
-        running_tokens = 0
-        running_gate_loss = 0.0
-        running_gate_examples = 0
+        running_examples = 0
         if train:
             model.train()
         else:
             model.eval()
-        sample_outputs: list[tuple[list[int], list[int]]] = []
         iterator = tqdm(
             data_loader,
             desc="train" if train else "val",
@@ -267,134 +248,66 @@ def train_initial_bc(
         )
         for batch in iterator:
             if isinstance(batch, (tuple, list)) and len(batch) == 4:
-                observations, labels, video_ids, frame_indices = batch
+                observations, _, video_ids, frame_indices = batch
             else:
-                observations, labels = batch
-                video_ids = None
-                frame_indices = None
-            observations = observations.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            if video_ids is not None:
-                video_ids_list = video_ids.cpu().tolist()
-                frame_indices_list = frame_indices.cpu().tolist()
-            else:
-                video_ids_list = None
-                frame_indices_list = None
+                raise ValueError("MineWorldFrameDataset must return (frames, labels, video_ids, frame_indices)")
+            observations = observations.to(device, non_blocking=True).contiguous()
+            video_ids_list = video_ids.cpu().tolist()
+            frame_indices_list = frame_indices.cpu().tolist()
+            agent_action_list = [
+                dataset.get_agent_action(vid, frame_idx)
+                for vid, frame_idx in zip(video_ids_list, frame_indices_list)
+            ]
+            action_keys = agent_action_list[0].keys()
+            agent_actions = {
+                key: torch.stack([action[key] for action in agent_action_list], dim=0).to(device, non_blocking=True)
+                for key in action_keys
+            }
+            batch_size = observations.size(0)
             with torch.set_grad_enabled(train):
-                batch_logits: list[torch.Tensor] = []
-                batch_gate_logits: list[torch.Tensor] = []
-                for sample_idx in range(observations.size(0)):
-                    vid = int(video_ids_list[sample_idx]) if video_ids_list is not None else sample_idx
-                    frame_idx = int(frame_indices_list[sample_idx]) if frame_indices_list is not None else -1
-                    logits_i, gate_logit_i, new_mem = model(
-                        observations[sample_idx : sample_idx + 1],
-                        return_gate=True,
-                    )
-                    batch_logits.append(logits_i)
-                    batch_gate_logits.append(gate_logit_i)
-                logits = torch.cat(batch_logits, dim=0)
-                gate_logits = torch.cat(batch_gate_logits, dim=0)
-
-            logits = logits.view(observations.size(0), action_length, action_vocab_size)
-            effective_labels = labels.clone()
-            gate_targets = (
-                (labels[:, cam_idx0] != cam_center0)
-                | (labels[:, cam_idx1] != cam_center1)
-            ).float()
-            invalid_camera = (
-                (labels[:, cam_idx0] == IGNORE_INDEX)
-                | (labels[:, cam_idx1] == IGNORE_INDEX)
-            )
-            gate_targets = gate_targets.masked_fill(invalid_camera, 0.0)
-            no_camera_mask = gate_targets == 0
-            effective_labels = effective_labels.clone()
-            effective_labels[no_camera_mask, cam_idx0] = IGNORE_INDEX
-            effective_labels[no_camera_mask, cam_idx1] = IGNORE_INDEX
-            flat_logits = logits.view(-1, action_vocab_size)
-            flat_labels = effective_labels.view(-1)
-            loss_per_token = F.cross_entropy(
-                flat_logits,
-                flat_labels,
-                ignore_index=IGNORE_INDEX,
-                reduction="none",
-            )
-            valid_mask = flat_labels != IGNORE_INDEX
-            if not torch.any(valid_mask):
-                continue
-            token_loss = loss_per_token[valid_mask].mean()
-            gate_loss = F.binary_cross_entropy_with_logits(
-                gate_logits,
-                gate_targets,
-            )
-            total_loss = token_loss + camera_gate_weight * gate_loss
-            if train:
-                optimizer.zero_grad()
-                total_loss.backward()
-                if grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                optimizer.step()
-            running_gate_loss += gate_loss.item() * gate_logits.numel()
-            running_gate_examples += gate_logits.numel()
-            valid_mask_matrix = effective_labels != IGNORE_INDEX
-            running_loss += loss_per_token[valid_mask].sum().item()
-            valid_tokens = valid_mask_matrix.sum().item()
-            running_tokens += valid_tokens
-            preds = logits.argmax(dim=-1)
-            correct_tokens = ((preds == effective_labels) & valid_mask_matrix).sum().item()
-            running_correct += correct_tokens
-            # sample validation outputs
-            if not train and len(sample_outputs) < 3:
-                max_samples = min(observations.size(0), 3 - len(sample_outputs))
-                for sample_idx in range(max_samples):
-                    sample_outputs.append(
-                        (
-                            effective_labels[sample_idx].detach().cpu().view(-1).tolist(),
-                            preds[sample_idx].detach().cpu().view(-1).tolist(),
-                        )
-                    )
-            if running_tokens > 0:
+                state_in = _move_state_to_device(model.initial_state(batch_size))
+                first = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                obs_dict = {"img": observations}
+                policy_tuple, _ = model(obs_dict, first, state_in)
+                pd_params = policy_tuple[0]
+                log_prob = model.get_logprob_of_action(pd_params, agent_actions)
+                loss = -log_prob.mean()
+                if train:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    if grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    optimizer.step()
+            running_loss += (-log_prob.detach()).sum().item()
+            running_examples += log_prob.numel()
+            if running_examples > 0:
                 iterator.set_postfix(
-                    loss=f"{running_loss / running_tokens:.4f}",
-                    acc=f"{running_correct / running_tokens:.4f}",
+                    loss=f"{running_loss / running_examples:.4f}",
                 )
-        gate_loss_avg = running_gate_loss / running_gate_examples if running_gate_examples > 0 else 0.0
-        info = {"samples": sample_outputs, "gate_loss": gate_loss_avg}
-        if running_tokens == 0:
-            return 0.0, 0.0, info
-        return running_loss / running_tokens, running_correct / running_tokens, info
+        if running_examples == 0:
+            return 0.0, {}
+        return running_loss / running_examples, {}
 
     for epoch in range(train_epochs):
-        train_loss, train_acc, train_info = run_epoch(loader, train=True)
+        train_loss, _ = run_epoch(loader, train=True)
         if len(val_subset) > 0:
-            val_loss, val_acc, val_info = run_epoch(val_loader, train=False)
+            val_loss, _ = run_epoch(val_loader, train=False)
         else:
-            val_loss, val_acc, val_info = None, None, {"samples": [], "gate_loss": 0.0}
+            val_loss, _ = None, {}
         metrics = {
             "train/loss": train_loss,
-            "train/acc": train_acc,
-            "train/gate_loss": train_info.get("gate_loss", 0.0),
         }
         if val_loss is not None:
             metrics["val/loss"] = val_loss
-            metrics["val/acc"] = val_acc
-            metrics["val/gate_loss"] = val_info.get("gate_loss", 0.0)
         wandb.log(metrics, step=epoch + 1)
         if val_loss is not None:
             print(
-                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f} "
-                f"- gate_loss: {train_info.get('gate_loss', 0.0):.4f} "
-                f"- val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f} "
-                f"- val_gate_loss: {val_info.get('gate_loss', 0.0):.4f}"
+                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} "
+                f"- val_loss: {val_loss:.4f} "
             )
-            val_samples = val_info.get("samples", [])
-            if val_samples:
-                print("Validation samples (target vs. prediction):")
-                for idx, (target_tokens, pred_tokens) in enumerate(val_samples, start=1):
-                    print(f"  Sample {idx}: target={target_tokens} pred={pred_tokens}")
         else:
             print(
-                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc:.4f} "
-                f"- gate_loss: {train_info.get('gate_loss', 0.0):.4f}"
+                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f}"
             )
         if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
             ckpt_path = save_checkpoint(f"epoch{epoch + 1:03d}")

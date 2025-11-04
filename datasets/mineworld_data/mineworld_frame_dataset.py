@@ -1,17 +1,24 @@
-from datasets.mineworld_data.mcdataset import MCDataset
+from __future__ import annotations
+
+import json
 from pathlib import Path
+from typing import Dict, List
+
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from torchvision import transforms
-from typing import Tuple
-import json
-from typing import List, Dict
 
-
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+from datasets.mineworld_data.mcdataset import MCDataset
+from evaluation.agent import ACTION_TRANSFORMER_KWARGS, AGENT_RESOLUTION, resize_image
+from evaluation.data_loader import (
+    CURSOR_FILE,
+    MINEREC_ORIGINAL_HEIGHT_PX,
+    composite_images_with_alpha,
+)
+from evaluation.run_inverse_dynamics_model import json_action_to_env_action
+from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
+from algorithms.foundation_dagger.vpt_model.actions import ActionTransformer, Buttons
 
 
 def _load_actions(json_path: Path) -> List[Dict]:
@@ -35,7 +42,6 @@ class MineWorldFrameDataset(Dataset):
         self,
         data_root: Path,
         context_frames: int = 8,
-        resize: int = 256,
         recursive: bool = True,
         max_open_captures: int = 2,
     ) -> None:
@@ -46,29 +52,33 @@ class MineWorldFrameDataset(Dataset):
             pass
         self.data_root = Path(data_root)
         self.context_frames = context_frames
-        self.resize = resize
-        self.samples: list[tuple[Path, Path, int, int]] = []
+        self.samples: list[tuple[Path, int, int]] = []
         self.actions_cache: dict[Path, list[dict]] = {}
+        self.video_step_infos: dict[int, list[Dict[str, object]]] = {}
         self.mc_dataset = MCDataset()
         self.mc_dataset.make_action_vocab(action_vocab_offset=0)
         self.action_vocab = self.mc_dataset.action_vocab
         self.action_vocab_size = len(self.action_vocab)
         self.action_length = self.mc_dataset.action_length
-        zero_bins = self.mc_dataset.camera_quantizer.discretize(np.array([0.0, 0.0]))
-        cam0_idx = int(zero_bins[0])
-        cam1_idx = int(zero_bins[1])
-        self.camera_center_tokens = (
-            self.action_vocab[f"cam_0_{cam0_idx}"],
-            self.action_vocab[f"cam_1_{cam1_idx}"],
-        )
-        self.camera_token_indices = (1, 2)
-        self.normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+        self.action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
+        self.action_transformer = ActionTransformer(**ACTION_TRANSFORMER_KWARGS)
+        self.agent_actions: dict[tuple[int, int], Dict[str, np.ndarray]] = {}
         self._capture_cache: dict[Path, cv2.VideoCapture] = {}
         self._last_frame_index: dict[Path, int] = {}
         self._video_ids: dict[Path, int] = {}
+        self._cursor_image_rgb, self._cursor_alpha = self._load_cursor()
         self._build_index(recursive=recursive)
         self._max_open_captures = max(1, int(max_open_captures))
         self._capture_order: list[Path] = []
+
+    def _load_cursor(self) -> tuple[np.ndarray, np.ndarray]:
+        cursor_image = cv2.imread(CURSOR_FILE, cv2.IMREAD_UNCHANGED)
+        if cursor_image is None:
+            raise FileNotFoundError(f"Cursor image missing at {CURSOR_FILE}")
+        cursor_image = cursor_image[:16, :16, :]
+        cursor_alpha = cursor_image[:, :, 3:] / 255.0
+        cursor_rgb = cursor_image[:, :, :3]
+        return cursor_rgb, cursor_alpha
 
     def _build_index(self, recursive: bool) -> None:
         pattern = "**/*.mp4" if recursive else "*.mp4"
@@ -97,12 +107,58 @@ class MineWorldFrameDataset(Dataset):
 
             usable = min(frame_count, len(actions))
             video_id = self._video_ids.setdefault(video_path, len(self._video_ids))
-            for frame_idx in range(self.context_frames - 1, usable):
-                json_action = actions[frame_idx]
-                _, is_null_action = self.mc_dataset.json_action_to_env_action(json_action)
+            video_steps = self.video_step_infos.setdefault(video_id, [])
+
+            attack_is_stuck = False
+            last_hotbar = 0
+
+            for step_idx in range(usable):
+                base_step = actions[step_idx]
+
+                if step_idx == 0:
+                    if base_step.get("mouse", {}).get("newButtons", []) == [0]:
+                        attack_is_stuck = True
+                elif attack_is_stuck:
+                    if 0 in base_step.get("mouse", {}).get("newButtons", []):
+                        attack_is_stuck = False
+
+                step_data = dict(base_step)
+                mouse_data = dict(step_data.get("mouse", {}))
+                if attack_is_stuck:
+                    mouse_data["buttons"] = [b for b in mouse_data.get("buttons", []) if b != 0]
+                step_data["mouse"] = mouse_data
+
+                action_dict, is_null_action = json_action_to_env_action(step_data)
+
+                current_hotbar = step_data.get("hotbar", last_hotbar)
+                if current_hotbar != last_hotbar:
+                    action_dict[f"hotbar.{current_hotbar + 1}"] = 1
+                last_hotbar = current_hotbar
+
                 if is_null_action:
                     continue
-                self.samples.append((video_path, action_path, frame_idx, video_id))
+
+                normalized_action: Dict[str, np.ndarray | int] = {
+                    key: value.copy() if isinstance(value, np.ndarray) else int(value)
+                    for key, value in action_dict.items()
+                }
+                agent_action_np = self._env_action_to_agent_np(normalized_action)
+                self.agent_actions[(video_id, step_idx)] = agent_action_np
+
+                video_steps.append(
+                    dict(
+                        frame_idx=step_idx,
+                        action=normalized_action,
+                        is_gui_open=bool(step_data.get("isGuiOpen", False)),
+                        cursor_x=float(mouse_data.get("x", 0.0)),
+                        cursor_y=float(mouse_data.get("y", 0.0)),
+                        agent_action=agent_action_np,
+                    )
+                )
+
+                if len(video_steps) >= self.context_frames:
+                    end_idx = len(video_steps) - 1
+                    self.samples.append((video_path, video_id, end_idx))
 
         if not self.samples:
             raise RuntimeError(
@@ -144,12 +200,40 @@ class MineWorldFrameDataset(Dataset):
         self._last_frame_index[video_path] = frame_idx
         return frame
 
-    def _frame_to_tensor(self, frame: np.ndarray) -> torch.Tensor:
+    def _frame_to_tensor(
+        self,
+        frame: np.ndarray,
+        is_gui_open: bool,
+        cursor_x: float,
+        cursor_y: float,
+    ) -> torch.Tensor:
+        if is_gui_open:
+            camera_scaling_factor = frame.shape[0] / MINEREC_ORIGINAL_HEIGHT_PX
+            x_pos = int(cursor_x * camera_scaling_factor)
+            y_pos = int(cursor_y * camera_scaling_factor)
+            composite_images_with_alpha(frame, self._cursor_image_rgb, self._cursor_alpha, x_pos, y_pos)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (self.resize, self.resize), interpolation=cv2.INTER_AREA)
-        tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
-        tensor = self.normalize(tensor)
+        frame = np.asarray(np.clip(frame, 0, 255), dtype=np.uint8)
+        frame = resize_image(frame, AGENT_RESOLUTION)
+        tensor = torch.from_numpy(frame).float()
         return tensor
+
+    def _env_action_to_agent_np(self, env_action: Dict[str, object]) -> Dict[str, np.ndarray]:
+        camera = np.asarray(env_action["camera"], dtype=np.float32)
+        env_format: Dict[str, np.ndarray] = {
+            "camera": camera[None],
+        }
+        for button_name in Buttons.ALL:
+            env_format[button_name] = np.asarray([env_action.get(button_name, 0)], dtype=np.int64)
+
+        minerl_action = self.action_transformer.env2policy(env_format)
+        if minerl_action["camera"].ndim == 1:
+            minerl_action = {k: v[None] for k, v in minerl_action.items()}
+        agent_action_np = self.action_mapper.from_factored(minerl_action)
+        agent_action: Dict[str, np.ndarray] = {}
+        for key, value in agent_action_np.items():
+            agent_action[key] = value[0].copy()
+        return agent_action
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
@@ -165,18 +249,37 @@ class MineWorldFrameDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        video_path, action_path, frame_idx, video_id = self.samples[index]
-        start_idx = frame_idx - (self.context_frames - 1)
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        video_path, video_id, end_idx = self.samples[index]
+        step_infos = self.video_step_infos[video_id]
+        start_idx = end_idx - self.context_frames + 1
         frame_tensors: list[torch.Tensor] = []
-        for idx in range(start_idx, frame_idx + 1):
-            frame = self._read_frame(video_path, idx)
-            tensor = self._frame_to_tensor(frame)
+        for step in step_infos[start_idx : end_idx + 1]:
+            frame = self._read_frame(video_path, step["frame_idx"])
+            tensor = self._frame_to_tensor(
+                frame,
+                is_gui_open=step["is_gui_open"],
+                cursor_x=step["cursor_x"],
+                cursor_y=step["cursor_y"],
+            )
             frame_tensors.append(tensor)
         frames_tensor = torch.stack(frame_tensors, dim=0)
 
-        json_action = self.actions_cache[action_path][frame_idx]
-        env_action, _ = self.mc_dataset.json_action_to_env_action(json_action)
-        action_indices = self.mc_dataset.get_action_index_from_actiondict(env_action, action_vocab_offset=0)
+        final_step = step_infos[end_idx]
+        action_indices = self.mc_dataset.get_action_index_from_actiondict(
+            final_step["action"],
+            action_vocab_offset=0,
+        )
         label = torch.tensor(action_indices, dtype=torch.long)
-        return frames_tensor, label, torch.tensor(video_id, dtype=torch.long), torch.tensor(frame_idx, dtype=torch.long)
+        return (
+            frames_tensor,
+            label,
+            torch.tensor(video_id, dtype=torch.long),
+            torch.tensor(final_step["frame_idx"], dtype=torch.long),
+        )
+
+    def get_agent_action(self, video_id: int, frame_idx: int) -> Dict[str, torch.Tensor]:
+        agent_np = self.agent_actions.get((int(video_id), int(frame_idx)))
+        if agent_np is None:
+            raise KeyError(f"Missing agent action for video_id={video_id}, frame_idx={frame_idx}")
+        return {key: torch.from_numpy(value.copy()) for key, value in agent_np.items()}
