@@ -8,6 +8,10 @@ from typing import Any, Dict, Optional
 import gym
 import cv2
 import minerl
+
+from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
+from evaluation.agent import MineRLAgent, ENV_KWARGS
+
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
@@ -119,6 +123,7 @@ def evaluate_policy(args: argparse.Namespace) -> None:
     pi_head_kwargs = model_args.get("pi_head_opts", {})
 
     env = gym.make(args.env_id)
+    #env = HumanSurvival(**ENV_KWARGS).make()
 
     output_root = _ensure_dir(Path(args.output_dir or DEFAULT_OUTPUT_DIR).expanduser().resolve())
     run_dir = _ensure_dir(output_root / f"{checkpoint_path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
