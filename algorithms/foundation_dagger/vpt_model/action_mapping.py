@@ -23,6 +23,7 @@ class ActionMapping(abc.ABC):
         sprint_sneak=["none", "sprint", "sneak"],
         use=["none", "use"],
         drop=["none", "drop"],
+        esc=["none", Buttons.ESC],
         attack=["none", "attack"],
         jump=["none", "jump"],
     )
@@ -232,4 +233,3 @@ class CameraHierarchicalMapping(ActionMapping):
 
     def get_zero_action(self):
         return self._null_action
-
