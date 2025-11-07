@@ -63,6 +63,7 @@ class MineWorldFrameDataset(Dataset):
         self.action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
         self.action_transformer = ActionTransformer(**ACTION_TRANSFORMER_KWARGS)
         self.agent_actions: dict[tuple[int, int], Dict[str, np.ndarray]] = {}
+        self.esc_actions: dict[tuple[int, int], int] = {}
         self._capture_cache: dict[Path, cv2.VideoCapture] = {}
         self._last_frame_index: dict[Path, int] = {}
         self._video_ids: dict[Path, int] = {}
@@ -144,6 +145,7 @@ class MineWorldFrameDataset(Dataset):
                 }
                 agent_action_np = self._env_action_to_agent_np(normalized_action)
                 self.agent_actions[(video_id, step_idx)] = agent_action_np
+                self.esc_actions[(video_id, step_idx)] = int(normalized_action.get("ESC", 0))
 
                 video_steps.append(
                     dict(
@@ -283,3 +285,6 @@ class MineWorldFrameDataset(Dataset):
         if agent_np is None:
             raise KeyError(f"Missing agent action for video_id={video_id}, frame_idx={frame_idx}")
         return {key: torch.from_numpy(value.copy()) for key, value in agent_np.items()}
+
+    def get_esc_flag(self, video_id: int, frame_idx: int) -> int:
+        return int(self.esc_actions.get((int(video_id), int(frame_idx)), 0))

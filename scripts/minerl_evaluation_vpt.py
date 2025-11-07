@@ -145,7 +145,6 @@ def evaluate_policy(args: argparse.Namespace) -> None:
         try:
             while not done and (args.max_steps is None or steps < args.max_steps):
                 action = agent.get_action(obs)
-                action["ESC"] = 0
                 obs, reward, done, _ = _step_env(env, action)
                 env.render()
 

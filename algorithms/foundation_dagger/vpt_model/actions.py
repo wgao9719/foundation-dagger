@@ -17,7 +17,6 @@ class Buttons:
     USE = "use"
     DROP = "drop"
     INVENTORY = "inventory"
-    ESC = "ESC"
 
     ALL = [
         ATTACK,
@@ -31,7 +30,6 @@ class Buttons:
         USE,
         DROP,
         INVENTORY,
-        ESC,
     ] + [f"hotbar.{i}" for i in range(1, 10)]
 
 

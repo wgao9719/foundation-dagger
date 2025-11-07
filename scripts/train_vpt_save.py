@@ -26,6 +26,7 @@ python -m scripts.train_vpt \
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import sys
 from pathlib import Path
@@ -56,8 +57,8 @@ from algorithms.foundation_dagger.vpt_model.policy import MinecraftAgentPolicy
 from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
 from algorithms.foundation_dagger.vpt_model.load_vpt_config import VPTConfig, parse_policy_config
 from algorithms.foundation_dagger.vpt_model.tree_util import tree_map, tree_multimap
-from algorithms.foundation_dagger.vpt_model.actions import ActionTransformer, Buttons
 
+from utils.SequentialBatchSampler import PerVideoSequentialBatchSampler
 
 def _load_hydra_configs(
     dataset_name: str,
@@ -136,10 +137,15 @@ def train_vpt_bc(
         val_split = max(1, int(round(subset_len * val_fraction)))
         if val_split >= subset_len:
             val_split = max(1, subset_len - 1)
-    val_indices = sorted(indices[:val_split])
-    train_indices = sorted(indices[val_split:subset_len])
+    val_indices = indices[:val_split]
+    train_indices = indices[val_split:subset_len]
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
+
+    train_video_to_positions: Dict[int, List[int]] = {}
+    for subset_idx, dataset_idx in enumerate(train_indices):
+        _, vid, _ = dataset.samples[dataset_idx]
+        train_video_to_positions.setdefault(int(vid), []).append(subset_idx)
 
     # load in training hparameters
     train_batch_size = batch_size
@@ -174,9 +180,14 @@ def train_vpt_bc(
 
     # initialize data loader
     prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
-    loader_kwargs = dict(
+    train_batch_sampler = PerVideoSequentialBatchSampler(
+        video_to_positions=train_video_to_positions,
         batch_size=train_batch_size,
-        shuffle=False,
+        seed=random_seed,
+    )
+
+    loader_kwargs = dict(
+        batch_sampler=train_batch_sampler,
         num_workers=train_workers,
         pin_memory=True,
         persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
@@ -268,6 +279,16 @@ def train_vpt_bc(
     def run_epoch(data_loader, train: bool):
         running_loss = 0.0
         running_examples = 0
+        total_samples = 0
+        correct_exact = 0.0
+        correct_buttons = 0.0
+        correct_camera = 0.0
+        entropy_sum = 0.0
+        entropy_count = 0
+        reset_events = 0
+        overlap_resets = 0
+        stride_sum = 0.0
+        stride_count = 0
         if train:
             model.train()
         else:
@@ -300,8 +321,15 @@ def train_vpt_bc(
                     stored_state = episode_hidden_states.get(vid)
                     last_frame = last_seen_frame.get(vid)
                     needs_reset = stored_state is None or last_frame is None or frame_idx <= last_frame
+                    reset_due_to_overlap = last_frame is not None and frame_idx <= last_frame
                     if needs_reset:
                         stored_state = _move_state_to_device(model.initial_state(1))
+                        reset_events += 1
+                        if reset_due_to_overlap:
+                            overlap_resets += 1
+                    elif last_frame is not None:
+                        stride_sum += frame_idx - last_frame
+                        stride_count += 1
                     if stored_state is not None:
                         episode_hidden_states[vid] = stored_state
                     state_inputs.append(stored_state)
@@ -313,6 +341,20 @@ def train_vpt_bc(
                 pd_params = policy_tuple[0]
                 final_pd_params = tree_map(lambda x: x[:, -1], pd_params)
                 log_prob = model.pi_head.logprob(agent_actions, final_pd_params)
+                pred_buttons = torch.argmax(final_pd_params["buttons"], dim=-1)
+                pred_camera = torch.argmax(final_pd_params["camera"], dim=-1)
+                target_buttons = agent_actions["buttons"]
+                target_camera = agent_actions["camera"]
+                buttons_match = pred_buttons.eq(target_buttons).all(dim=-1)
+                camera_match = pred_camera.eq(target_camera).all(dim=-1)
+                exact_match = buttons_match & camera_match
+                correct_buttons += buttons_match.float().sum().item()
+                correct_camera += camera_match.float().sum().item()
+                correct_exact += exact_match.float().sum().item()
+                entropy_values = model.pi_head.entropy(final_pd_params)
+                entropy_per_sample = entropy_values.reshape(entropy_values.shape[0], -1).mean(dim=1)
+                entropy_sum += entropy_per_sample.detach().sum().item()
+                entropy_count += entropy_per_sample.numel()
                 loss = -log_prob.mean()
                 if train:
                     optimizer.zero_grad()
@@ -325,27 +367,44 @@ def train_vpt_bc(
                         episode_hidden_states[vid] = _slice_state(detached_state, idx)
                 for vid, frame_idx in zip(video_ids_list, frame_indices_list):
                     last_seen_frame[vid] = frame_idx
+            total_samples += batch_size
             running_loss += (-log_prob.detach()).sum().item()
             running_examples += log_prob.numel()
             if running_examples > 0:
                 iterator.set_postfix(
                     loss=f"{running_loss / running_examples:.4f}",
                 )
+        metrics = {}
+        if total_samples > 0:
+            metrics["accuracy"] = correct_exact / total_samples
+            metrics["accuracy_buttons"] = correct_buttons / total_samples
+            metrics["accuracy_camera"] = correct_camera / total_samples
+            metrics["reset_fraction"] = reset_events / total_samples
+            metrics["overlap_reset_fraction"] = overlap_resets / total_samples
+        if stride_count > 0:
+            metrics["avg_stride"] = stride_sum / stride_count
+        if entropy_count > 0:
+            metrics["entropy"] = entropy_sum / entropy_count
         if running_examples == 0:
-            return 0.0, {}
-        return running_loss / running_examples, {}
+            return 0.0, metrics
+        return running_loss / running_examples, metrics
 
     for epoch in range(train_epochs):
-        train_loss, _ = run_epoch(loader, train=True)
+        train_batch_sampler.set_epoch(epoch)
+        train_loss, train_stats = run_epoch(loader, train=True)
         if len(val_subset) > 0:
-            val_loss, _ = run_epoch(val_loader, train=False)
+            val_loss, val_stats = run_epoch(val_loader, train=False)
         else:
-            val_loss, _ = None, {}
+            val_loss, val_stats = None, {}
         metrics = {
             "train/loss": train_loss,
         }
+        for key, value in train_stats.items():
+            metrics[f"train/{key}"] = value
         if val_loss is not None:
             metrics["val/loss"] = val_loss
+            for key, value in val_stats.items():
+                metrics[f"val/{key}"] = value
         wandb.log(metrics, step=epoch + 1)
         if val_loss is not None:
             print(

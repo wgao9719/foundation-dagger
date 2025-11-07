@@ -198,9 +198,18 @@ class MineRLAgent:
         # The "first" argument could be used to reset tell episode
         # boundaries, but we are only using this for predicting (for now),
         # so we do not hassle with it yet.
-        agent_action, self.hidden_state, _ = self.policy.act(
+        agent_action, self.hidden_state, info = self.policy.act(
             agent_input, self._dummy_first, self.hidden_state,
             stochastic=True
         )
         minerl_action = self._agent_action_to_env(agent_action)
+        esc_value = 0
+        if info is not None:
+            esc_action = info.get("esc_action")
+            esc_prob = info.get("esc_prob")
+            if esc_action is not None:
+                esc_value = int(esc_action.detach().cpu().item() > 0.5)
+            elif esc_prob is not None:
+                esc_value = int(esc_prob.detach().cpu().item() > 0.5)
+        minerl_action["ESC"] = esc_value
         return minerl_action

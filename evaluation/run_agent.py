@@ -44,7 +44,6 @@ def main(model, weights):
 
     while True:
         minerl_action = agent.get_action(obs)
-        minerl_action["ESC"] = 0
         obs, reward, done, info = _step_env(env, minerl_action)
         env.render()
         if done:

@@ -23,7 +23,6 @@ class ActionMapping(abc.ABC):
         sprint_sneak=["none", "sprint", "sneak"],
         use=["none", "use"],
         drop=["none", "drop"],
-        esc=["none", Buttons.ESC],
         attack=["none", "attack"],
         jump=["none", "jump"],
     )

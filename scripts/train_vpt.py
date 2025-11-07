@@ -41,6 +41,7 @@ from gym3.types import DictType
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 import wandb
@@ -209,8 +210,8 @@ def train_vpt_bc(
 
     # initialize weights
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # path = "/Users/willi1/foundation-dagger/diffusion-forcing-transformer/checkpoints/vpt/foundation-model-1x.weights"
-    path = "/workspace/foundation-dagger/foundation-dagger/checkpoints/vpt/foundation-model-1x.weights"
+    path = "/Users/willi1/foundation-dagger/diffusion-forcing-transformer/checkpoints/vpt/foundation-model-1x.weights"
+    # path = "/workspace/foundation-dagger/foundation-dagger/checkpoints/vpt/foundation-model-1x.weights"
     # model.load_state_dict(torch.load(path, map_location=device), strict=False)
     state_dict = torch.load(path, map_location=device)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -283,6 +284,9 @@ def train_vpt_bc(
         correct_exact = 0.0
         correct_buttons = 0.0
         correct_camera = 0.0
+        correct_esc = 0.0
+        running_esc_loss = 0.0
+        esc_examples = 0
         entropy_sum = 0.0
         entropy_count = 0
         reset_events = 0
@@ -307,11 +311,17 @@ def train_vpt_bc(
                 dataset.get_agent_action(vid, frame_idx)
                 for vid, frame_idx in zip(video_ids_list, frame_indices_list)
             ]
+            esc_targets = torch.tensor(
+                [dataset.get_esc_flag(vid, frame_idx) for vid, frame_idx in zip(video_ids_list, frame_indices_list)],
+                dtype=torch.float32,
+                device=device,
+            )
             action_keys = agent_action_list[0].keys()
             agent_actions = {
                 key: torch.stack([action[key] for action in agent_action_list], dim=0).to(device, non_blocking=True)
                 for key in action_keys
             }
+            policy_actions = agent_actions
             batch_size = observations.size(0)
             seq_len = observations.size(1) if observations.dim() >= 2 else 1
             with torch.set_grad_enabled(train):
@@ -339,23 +349,33 @@ def train_vpt_bc(
                 obs_dict = {"img": observations}
                 policy_tuple, state_out = model(obs_dict, first, state_in)
                 pd_params = policy_tuple[0]
+                extra_outputs = policy_tuple[2] or {}
                 final_pd_params = tree_map(lambda x: x[:, -1], pd_params)
-                log_prob = model.pi_head.logprob(agent_actions, final_pd_params)
+                log_prob = model.pi_head.logprob(policy_actions, final_pd_params)
                 pred_buttons = torch.argmax(final_pd_params["buttons"], dim=-1)
                 pred_camera = torch.argmax(final_pd_params["camera"], dim=-1)
-                target_buttons = agent_actions["buttons"]
-                target_camera = agent_actions["camera"]
+                target_buttons = policy_actions["buttons"]
+                target_camera = policy_actions["camera"]
                 buttons_match = pred_buttons.eq(target_buttons).all(dim=-1)
                 camera_match = pred_camera.eq(target_camera).all(dim=-1)
                 exact_match = buttons_match & camera_match
                 correct_buttons += buttons_match.float().sum().item()
                 correct_camera += camera_match.float().sum().item()
                 correct_exact += exact_match.float().sum().item()
+                esc_logits = extra_outputs.get("logit_esc")
+                esc_loss = torch.tensor(0.0, device=device)
+                if esc_logits is not None:
+                    final_esc_logits = esc_logits[:, -1]
+                    esc_loss = F.binary_cross_entropy_with_logits(final_esc_logits, esc_targets)
+                    esc_predictions = (final_esc_logits > 0).float()
+                    correct_esc += esc_predictions.eq(esc_targets).float().sum().item()
+                    running_esc_loss += esc_loss.detach().item() * esc_targets.numel()
+                    esc_examples += esc_targets.numel()
                 entropy_values = model.pi_head.entropy(final_pd_params)
                 entropy_per_sample = entropy_values.reshape(entropy_values.shape[0], -1).mean(dim=1)
                 entropy_sum += entropy_per_sample.detach().sum().item()
                 entropy_count += entropy_per_sample.numel()
-                loss = -log_prob.mean()
+                loss = -log_prob.mean() + esc_loss
                 if train:
                     optimizer.zero_grad()
                     loss.backward()
@@ -383,6 +403,9 @@ def train_vpt_bc(
             metrics["overlap_reset_fraction"] = overlap_resets / total_samples
         if stride_count > 0:
             metrics["avg_stride"] = stride_sum / stride_count
+        if esc_examples > 0:
+            metrics["esc_loss"] = running_esc_loss / esc_examples
+            metrics["accuracy_esc"] = correct_esc / esc_examples
         if entropy_count > 0:
             metrics["entropy"] = entropy_sum / entropy_count
         if running_examples == 0:

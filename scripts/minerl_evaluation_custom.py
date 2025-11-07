@@ -153,8 +153,6 @@ def _decode_action(
     # Reset inventory-related toggles that would pause the game.
     if "inventory" in action:
         action["inventory"] = 0
-    if "ESC" in action:
-        action["ESC"] = 0
     return action
 
 

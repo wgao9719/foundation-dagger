@@ -233,6 +233,8 @@ class MinecraftAgentPolicy(nn.Module):
 
         self.value_head = self.make_value_head(self.net.output_latent_size())
         self.pi_head = self.make_action_head(self.net.output_latent_size(), **pi_head_kwargs)
+        self.esc_head = nn.Linear(self.net.output_latent_size(), 1)
+        self._init_esc_head()
 
     def make_value_head(self, v_out_size: int, norm_type: str = "ewma", norm_kwargs: Optional[Dict] = None):
         return ScaledMSEHead(v_out_size, 1, norm_type=norm_type, norm_kwargs=norm_kwargs)
@@ -243,11 +245,17 @@ class MinecraftAgentPolicy(nn.Module):
     def initial_state(self, batch_size: int):
         return self.net.initial_state(batch_size)
 
+    def _init_esc_head(self):
+        nn.init.zeros_(self.esc_head.weight)
+        with th.no_grad():
+            self.esc_head.bias.fill_(-6.907755278982137)  # log(1e-3 / (1 - 1e-3))
+
     def reset_parameters(self):
         super().reset_parameters()
         self.net.reset_parameters()
         self.pi_head.reset_parameters()
         self.value_head.reset_parameters()
+        self._init_esc_head()
 
     def forward(self, obs, first: th.Tensor, state_in):
         if isinstance(obs, dict):
@@ -265,8 +273,10 @@ class MinecraftAgentPolicy(nn.Module):
 
         pi_logits = self.pi_head(pi_h, mask=mask)
         vpred = self.value_head(v_h)
+        esc_logit = self.esc_head(pi_h).squeeze(-1)
+        esc_prob = th.sigmoid(esc_logit)
 
-        return (pi_logits, vpred, None), state_out
+        return (pi_logits, vpred, {"logit_esc": esc_logit, "p_esc": esc_prob}), state_out
 
     def get_logprob_of_action(self, pd, action):
         """
@@ -300,7 +310,7 @@ class MinecraftAgentPolicy(nn.Module):
         obs = tree_map(lambda x: x.unsqueeze(1), obs)
         first = first.unsqueeze(1)
 
-        (pd, vpred, _), state_out = self(obs=obs, first=first, state_in=state_in)
+        (pd, vpred, extras), state_out = self(obs=obs, first=first, state_in=state_in)
 
         return pd, self.value_head.denormalize(vpred)[:, 0], state_out
 
@@ -310,7 +320,7 @@ class MinecraftAgentPolicy(nn.Module):
         obs = tree_map(lambda x: x.unsqueeze(1), obs)
         first = first.unsqueeze(1)
 
-        (pd, vpred, _), state_out = self(obs=obs, first=first, state_in=state_in)
+        (pd, vpred, extras), state_out = self(obs=obs, first=first, state_in=state_in)
 
         if taken_action is None:
             ac = self.pi_head.sample(pd, deterministic=not stochastic)
@@ -319,8 +329,33 @@ class MinecraftAgentPolicy(nn.Module):
         log_prob = self.pi_head.logprob(ac, pd)
         assert not th.isnan(log_prob).any()
 
+        esc_logit = None
+        esc_prob = None
+        if extras:
+            esc_logit = extras.get("logit_esc")
+            esc_prob = extras.get("p_esc")
+            if esc_logit is not None:
+                esc_logit = esc_logit[:, 0]
+            if esc_prob is not None:
+                esc_prob = esc_prob[:, 0]
+            elif esc_logit is not None:
+                esc_prob = th.sigmoid(esc_logit)
+
+        esc_action = None
+        if esc_prob is not None:
+            if stochastic:
+                esc_action = th.bernoulli(esc_prob).to(esc_prob.dtype)
+            else:
+                esc_action = (esc_prob > 0.5).float()
+
         # After unsqueezing, squeeze back to remove fictitious time dimension
         result = {"log_prob": log_prob[:, 0], "vpred": self.value_head.denormalize(vpred)[:, 0]}
+        if esc_prob is not None:
+            result["esc_prob"] = esc_prob
+            if esc_logit is not None:
+                result["esc_logit"] = esc_logit
+            if esc_action is not None:
+                result["esc_action"] = esc_action
         if return_pd:
             result["pd"] = tree_map(lambda x: x[:, 0], pd)
         ac = tree_map(lambda x: x[:, 0], ac)
