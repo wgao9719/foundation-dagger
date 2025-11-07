@@ -83,13 +83,19 @@ def _prep_frame(frame: np.ndarray, transform: transforms.Compose, device: torch.
     return tensor.unsqueeze(0).to(device, non_blocking=True)
 
 
-def _camera_bins_from_tokens(tokens: Iterable[str]) -> np.ndarray:
-    camera_bins = []
+def _legacy_camera_bins_from_tokens(tokens: Iterable[str]) -> np.ndarray:
+    camera_bins = [0, 0]
     for token in tokens:
-        try:
-            camera_bins.append(int(token.split("_")[-1]))
-        except (AttributeError, ValueError, IndexError):
-            camera_bins.append(0)
+        if token.startswith("cam_0_"):
+            try:
+                camera_bins[0] = int(token.rsplit("_", 1)[-1])
+            except (ValueError, IndexError):
+                camera_bins[0] = 0
+        elif token.startswith("cam_1_"):
+            try:
+                camera_bins[1] = int(token.rsplit("_", 1)[-1])
+            except (ValueError, IndexError):
+                camera_bins[1] = 0
     return np.array(camera_bins, dtype=np.int64)
 
 
@@ -106,13 +112,17 @@ def _decode_action(
         camera_value = np.asarray(camera_value, dtype=np.float32)
     action["camera"] = camera_value.astype(np.float32, copy=False)
 
+    gate_token_idx = int(token_indices[1]) if len(token_indices) > 1 else None
+    joint_token_idx = int(token_indices[2]) if len(token_indices) > 2 else None
     inv_vocab = {v: k for k, v in mc_dataset.action_vocab.items()}
     tokens = [inv_vocab.get(idx, "<null_act>") for idx in token_indices]
 
     if len(tokens) < 3:
         return action
-
-    cam_bins = _camera_bins_from_tokens(tokens[1:3])
+    if gate_token_idx is not None and joint_token_idx is not None and hasattr(mc_dataset, "camera_tokens_to_bins"):
+        cam_bins = mc_dataset.camera_tokens_to_bins(gate_token_idx, joint_token_idx)
+    else:
+        cam_bins = _legacy_camera_bins_from_tokens(tokens[1:3])
     camera = mc_dataset.camera_quantizer.undiscretize(cam_bins)
     action["camera"][0] = float(camera[0])
     action["camera"][1] = float(camera[1])

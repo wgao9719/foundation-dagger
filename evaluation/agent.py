@@ -2,7 +2,7 @@ import numpy as np
 import torch as th
 import cv2
 from gym3.types import DictType
-from gym import spaces
+from gymnasium import spaces
 
 from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
 from algorithms.foundation_dagger.vpt_model.actions import ActionTransformer

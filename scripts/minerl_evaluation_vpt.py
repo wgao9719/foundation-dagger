@@ -16,6 +16,25 @@ from evaluation.agent import MineRLAgent
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT_DIR / "configurations"
 
+
+def _reset_env(env, *, seed=None):
+    reset_out = env.reset(seed=seed) if seed is not None else env.reset()
+    if isinstance(reset_out, tuple):
+        obs, info = reset_out
+    else:
+        obs, info = reset_out, {}
+    return obs, info
+
+
+def _step_env(env, action):
+    step_out = env.step(action)
+    if len(step_out) == 5:
+        obs, reward, terminated, truncated, info = step_out
+        done = bool(terminated or truncated)
+    else:
+        obs, reward, done, info = step_out
+    return obs, reward, done, info
+
 def _load_hydra_configs(
     algorithm_name: str,
 ) -> Dict[str, Any]:
@@ -55,10 +74,7 @@ def evaluate_policy(args: argparse.Namespace) -> None:
     agent.load_weights(checkpoint_path)
     
     for episode_idx in range(args.episodes):
-        if args.seed is not None:
-            obs = env.reset(seed=args.seed + episode_idx)
-        else:
-            obs = env.reset()
+        obs, _ = _reset_env(env, seed=(args.seed + episode_idx) if args.seed is not None else None)
         agent.reset()
 
         total_reward = 0.0
@@ -68,7 +84,7 @@ def evaluate_policy(args: argparse.Namespace) -> None:
         while not done and (args.max_steps is None or steps < args.max_steps):
             action = agent.get_action(obs)
             action["ESC"] = 0
-            obs, reward, done, _ = env.step(action)
+            obs, reward, done, _ = _step_env(env, action)
             env.render()
 
             total_reward += float(reward)

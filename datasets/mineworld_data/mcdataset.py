@@ -209,9 +209,9 @@ class MCDataset(torch.utils.data.Dataset):
     """
     def __init__(self,
                  action_length: int = 11,  # including bos and eos
-                 camera_binsize: int = 9,  # 2 in vpt
-                 camera_maxval: int = 90,  # 10 in vpt
-                 camera_mu: float = 11.4887,  # 10 in vpt
+                 camera_binsize: int = 2,  # 2 in vpt
+                 camera_maxval: int = 10,  # 10 in vpt
+                 camera_mu: float = 10,  # 10 in vpt
                  quantization_scheme: str = "mu_law",
     ):
         self.action_length = action_length
