@@ -26,6 +26,7 @@ python -m scripts.train_vpt \
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import sys
 from pathlib import Path
@@ -35,7 +36,7 @@ import numpy as np
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from gym3.types import DictType
 
 import torch
@@ -55,9 +56,9 @@ CONFIG_DIR = ROOT_DIR / "configurations"
 from algorithms.foundation_dagger.vpt_model.policy import MinecraftAgentPolicy
 from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
 from algorithms.foundation_dagger.vpt_model.load_vpt_config import VPTConfig, parse_policy_config
-from algorithms.foundation_dagger.vpt_model.tree_util import tree_map
-from algorithms.foundation_dagger.vpt_model.actions import ActionTransformer, Buttons
+from algorithms.foundation_dagger.vpt_model.tree_util import tree_map, tree_multimap
 
+from utils.SequentialBatchSampler import PerVideoSequentialBatchSampler
 
 def _load_hydra_configs(
     dataset_name: str,
@@ -108,11 +109,6 @@ def train_vpt_bc(
         recursive=recursive,
         max_open_captures=int(dataset_cfg.get("max_open_captures", 2)),
     )
-    print("MineWorldFrameDataset action transformer:", dataset.action_transformer.camera_binsize,
-           dataset.action_transformer.camera_maxval,
-           dataset.action_transformer.camera_mu,
-           dataset.action_transformer.camera_quantization_scheme)
-
     train_cfg = exp_cfg.get("training", {})
     opt_cfg = exp_cfg.get("optimizer", {})
 
@@ -141,10 +137,15 @@ def train_vpt_bc(
         val_split = max(1, int(round(subset_len * val_fraction)))
         if val_split >= subset_len:
             val_split = max(1, subset_len - 1)
-    val_indices = sorted(indices[:val_split])
-    train_indices = sorted(indices[val_split:subset_len])
+    val_indices = indices[:val_split]
+    train_indices = indices[val_split:subset_len]
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
+
+    train_video_to_positions: Dict[int, List[int]] = {}
+    for subset_idx, dataset_idx in enumerate(train_indices):
+        _, vid, _ = dataset.samples[dataset_idx]
+        train_video_to_positions.setdefault(int(vid), []).append(subset_idx)
 
     # load in training hparameters
     train_batch_size = batch_size
@@ -179,9 +180,14 @@ def train_vpt_bc(
 
     # initialize data loader
     prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
-    loader_kwargs = dict(
+    train_batch_sampler = PerVideoSequentialBatchSampler(
+        train_video_to_positions=train_video_to_positions,
         batch_size=train_batch_size,
-        shuffle=False,
+        seed=random_seed,
+    )
+
+    loader_kwargs = dict(
+        batch_sampler=train_batch_sampler,
         num_workers=train_workers,
         pin_memory=True,
         persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
@@ -203,8 +209,8 @@ def train_vpt_bc(
 
     # initialize weights
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    path = "/Users/willi1/foundation-dagger/diffusion-forcing-transformer/checkpoints/vpt/foundation-model-1x.weights"
-    # path = "/workspace/foundation-dagger/foundation-dagger/checkpoints/vpt/foundation-model-1x.weights"
+    # path = "/Users/willi1/foundation-dagger/diffusion-forcing-transformer/checkpoints/vpt/foundation-model-1x.weights"
+    path = "/workspace/foundation-dagger/foundation-dagger/checkpoints/vpt/foundation-model-1x.weights"
     # model.load_state_dict(torch.load(path, map_location=device), strict=False)
     state_dict = torch.load(path, map_location=device)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -224,212 +230,22 @@ def train_vpt_bc(
             return type(state)(_move_state_to_device(s) for s in state)
         return state.to(device, non_blocking=True)
 
+    def _stack_states_for_batch(state_list):
+        if not state_list or state_list[0] is None:
+            return None
+        if len(state_list) == 1:
+            return state_list[0]
+        return tree_multimap(lambda *xs: torch.cat(xs, dim=0), state_list[0], *state_list[1:])
+
+    def _slice_state(state, index):
+        if state is None:
+            return None
+        return tree_map(lambda x: x[index : index + 1].detach().clone(), state)
+
     def _detach_state(state):
         if state is None:
             return None
-        return tree_map(lambda x: x.detach() if isinstance(x, torch.Tensor) else x, state)
-
-    # Diagnostics to verify checkpoint alignment with dataset labels.
-    print(f"[diagnostics] checkpoint load -> missing: {len(missing_keys)} | unexpected: {len(unexpected_keys)}")
-    diag_loader = DataLoader(
-        train_subset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-    )
-    if len(train_subset) == 0:
-        print("[diagnostics] dataset empty; skipping log-prob check.")
-    else:
-        diag_limit = min(64, len(train_subset))
-        total_logprobs: List[float] = []
-        buttons_logprobs: List[float] = []
-        camera_logprobs: List[float] = []
-        raw_cameras: List[np.ndarray] = []
-        env_actions: List[Dict[str, object]] = []
-        diag_state_cache: Dict[int, object] = {}
-        diag_last_frame: Dict[int, int] = {}
-        buttons_targets: List[torch.Tensor] = []
-        camera_targets: List[torch.Tensor] = []
-        final_pd_buffers: List[Dict[str, torch.Tensor]] = []
-        with torch.no_grad():
-            for step_i, (obs_seq, _, video_id_tensor, frame_idx_tensor) in enumerate(diag_loader):
-                if step_i >= diag_limit:
-                    break
-                obs_seq = obs_seq.to(device, non_blocking=True)
-                vid = int(video_id_tensor.item())
-                frame_idx = int(frame_idx_tensor.item())
-
-                agent_action_np = dataset.get_agent_action(vid, frame_idx)
-                agent_action = {
-                    key: agent_action_np[key].unsqueeze(0).to(device, non_blocking=True)
-                    for key in agent_action_np.keys()
-                }
-
-                cached_state = diag_state_cache.get(vid)
-                last_seen = diag_last_frame.get(vid)
-                if cached_state is None or last_seen is None or frame_idx <= last_seen:
-                    state_in = _move_state_to_device(model.initial_state(1))
-                    first_diag = torch.zeros(1, obs_seq.size(1), dtype=torch.bool, device=device)
-                    first_diag[:, 0] = True
-                else:
-                    state_in = _move_state_to_device(cached_state)
-                    first_diag = torch.zeros(1, obs_seq.size(1), dtype=torch.bool, device=device)
-
-                policy_tuple_diag, state_out = model({"img": obs_seq}, first_diag, state_in)
-                final_pd_diag = tree_map(lambda x: x[:, -1], policy_tuple_diag[0])
-                final_pd_buffers.append(tree_map(lambda t: t.detach().cpu(), final_pd_diag))
-                total_lp = model.pi_head.logprob(agent_action, final_pd_diag)
-                buttons_lp = model.pi_head._modules["buttons"].logprob(
-                    agent_action["buttons"], final_pd_diag["buttons"]
-                )
-                camera_lp = model.pi_head._modules["camera"].logprob(
-                    agent_action["camera"], final_pd_diag["camera"]
-                )
-
-                total_logprobs.append(total_lp.item())
-                buttons_logprobs.append(buttons_lp.item())
-                camera_logprobs.append(camera_lp.item())
-                buttons_targets.append(agent_action["buttons"].detach().cpu())
-                camera_targets.append(agent_action["camera"].detach().cpu())
-
-                diag_state_cache[vid] = _detach_state(state_out)
-                diag_last_frame[vid] = frame_idx
-
-                # Retrieve underlying continuous camera deltas for context
-                step_entries = dataset.video_step_infos[int(vid)]
-                step_info = next(
-                    (entry for entry in step_entries if entry["frame_idx"] == frame_idx),
-                    None,
-                )
-                if step_info is not None:
-                    raw_cameras.append(np.asarray(step_info["action"]["camera"], dtype=np.float32))
-                    env_actions.append(step_info["action"])
-
-        if not total_logprobs:
-            print("[diagnostics] warning: unable to compute log-probs; skipping report.")
-        else:
-            print(
-                "[diagnostics] log-prob means ->"
-                f" total {np.mean(total_logprobs):.3f}"
-                f" | buttons {np.mean(buttons_logprobs):.3f}"
-                f" | camera {np.mean(camera_logprobs):.3f}"
-            )
-
-            buttons_stack = torch.cat(buttons_targets, dim=0) if buttons_targets else None
-            camera_stack = torch.cat(camera_targets, dim=0) if camera_targets else None
-            if buttons_stack is not None and camera_stack is not None:
-                print(
-                    "[diagnostics] label ranges -> buttons",
-                    (int(buttons_stack.min().item()), int(buttons_stack.max().item())),
-                    "| camera indices",
-                    (int(camera_stack.min().item()), int(camera_stack.max().item())),
-                )
-            else:
-                print("[diagnostics] warning: missing action targets; skipping range report.")
-
-            raw_cameras_np = np.stack(raw_cameras, axis=0) if raw_cameras else np.zeros((0, 2), dtype=np.float32)
-            if raw_cameras_np.size == 0:
-                print("[diagnostics] warning: unable to fetch raw camera deltas; skipping quantiser check.")
-                return
-
-            if buttons_stack is None or camera_stack is None or not final_pd_buffers:
-                print("[diagnostics] insufficient data for detailed action diagnostics; skipping quantiser check.")
-            else:
-                with torch.no_grad():
-                    agent_actions_diag = {
-                        "buttons": buttons_stack.to(device, non_blocking=True),
-                        "camera": camera_stack.to(device, non_blocking=True),
-                    }
-                    final_pd_diag = {
-                        "buttons": torch.cat([buf["buttons"] for buf in final_pd_buffers], dim=0).to(
-                            device, non_blocking=True
-                        ),
-                        "camera": torch.cat([buf["camera"] for buf in final_pd_buffers], dim=0).to(
-                            device, non_blocking=True
-                        ),
-                    }
-
-                    mu_bins = dataset.action_transformer.quantizer.discretize(raw_cameras_np)
-                    linear_transformer = ActionTransformer(
-                        camera_binsize=2,
-                        camera_maxval=10,
-                        camera_mu=5,
-                        camera_quantization_scheme="linear",
-                    )
-                    linear_bins = linear_transformer.quantizer.discretize(raw_cameras_np)
-                    mu5_transformer = ActionTransformer(
-                        camera_binsize=2,
-                        camera_maxval=10,
-                        camera_mu=5,
-                        camera_quantization_scheme="mu_law",
-                    )
-
-                    alt_agent_actions = []
-                    for env_action in env_actions[: len(raw_cameras_np)]:
-                        env_format_alt = {
-                            "camera": np.asarray(env_action["camera"], dtype=np.float32)[None],
-                        }
-                        for button_name in Buttons.ALL:
-                            env_format_alt[button_name] = np.asarray([env_action.get(button_name, 0)], dtype=np.int64)
-                        alt_factored = mu5_transformer.env2policy(env_format_alt)
-                        if alt_factored["camera"].ndim == 1:
-                            alt_factored = {k: v[None] for k, v in alt_factored.items()}
-                        alt_agent_actions.append(dataset.action_mapper.from_factored(alt_factored))
-
-                    if len(alt_agent_actions) == agent_actions_diag["buttons"].size(0):
-                        alt_camera = torch.stack(
-                            [torch.from_numpy(a["camera"][0].copy()) for a in alt_agent_actions],
-                            dim=0,
-                        ).to(device, non_blocking=True)
-                        alt_actions_diag = {
-                            "buttons": agent_actions_diag["buttons"],
-                            "camera": alt_camera,
-                        }
-                        alt_logprob = model.pi_head.logprob(alt_actions_diag, final_pd_diag)
-                        alt_camera_logprob = model.pi_head._modules["camera"].logprob(
-                            alt_actions_diag["camera"], final_pd_diag["camera"]
-                        )
-                    else:
-                        alt_logprob = None
-                        alt_camera_logprob = None
-
-                    print(
-                        "[diagnostics] raw camera deltas ->",
-                        "min",
-                        raw_cameras_np.min(axis=0),
-                        "max",
-                        raw_cameras_np.max(axis=0),
-                        "mu-law bins sample",
-                        mu_bins[:5],
-                        "linear bins sample",
-                        linear_bins[:5],
-                        "mu=5 mu-law bins sample",
-                        mu5_transformer.quantizer.discretize(raw_cameras_np)[:5],
-                    )
-                    if alt_logprob is not None:
-                        print(
-                            "[diagnostics] alt mu=5 mu-law log-probs ->"
-                            f" total {alt_logprob.mean().item():.3f}"
-                            f" | camera {alt_camera_logprob.mean().item():.3f}"
-                        )
-                    else:
-                        print("[diagnostics] alt mu=5 mu-law log-probs skipped (mismatched sample count).")
-
-                    det_actions = model.pi_head.sample(final_pd_diag, deterministic=True)
-                    combos = dataset.action_mapper.BUTTONS_IDX_TO_COMBINATION
-                    cam_idx_to_combo = dataset.action_mapper.camera_idx_to_combination
-                    decoded_targets = [
-                        (combos[int(b.item())], cam_idx_to_combo[int(c.item())])
-                        for b, c in zip(agent_actions_diag["buttons"].cpu(), agent_actions_diag["camera"].cpu())
-                    ]
-                    decoded_preds = [
-                        (combos[int(b.item())], cam_idx_to_combo[int(c.item())])
-                        for b, c in zip(det_actions["buttons"].cpu(), det_actions["camera"].cpu())
-                    ]
-                    print("[diagnostics] first target button/camera combos:", decoded_targets[:5])
-                    print("[diagnostics] first predicted button/camera combos:", decoded_preds[:5])
-
+        return tree_map(lambda x: x.detach(), state)
 
     def save_checkpoint(suffix: str | None = None) -> Path:
         if suffix:
@@ -463,13 +279,14 @@ def train_vpt_bc(
     def run_epoch(data_loader, train: bool):
         running_loss = 0.0
         running_examples = 0
-        state_cache: Dict[int, object] = {}
         if train:
             model.train()
         else:
             model.eval()
 
         iterator = tqdm(data_loader, desc="train" if train else "val", leave=False, ncols=80)
+        episode_hidden_states: Dict[int, Any] = {}
+        last_seen_frame: Dict[int, int] = {}
 
         for batch in iterator:
             observations, _, video_ids, frame_indices = batch
@@ -477,45 +294,50 @@ def train_vpt_bc(
             video_ids_list = video_ids.cpu().tolist()
             frame_indices_list = frame_indices.cpu().tolist()
             agent_action_list = [
-                dataset.get_agent_action(int(vid), int(frame_idx))
+                dataset.get_agent_action(vid, frame_idx)
                 for vid, frame_idx in zip(video_ids_list, frame_indices_list)
             ]
+            action_keys = agent_action_list[0].keys()
+            agent_actions = {
+                key: torch.stack([action[key] for action in agent_action_list], dim=0).to(device, non_blocking=True)
+                for key in action_keys
+            }
+            batch_size = observations.size(0)
             seq_len = observations.size(1) if observations.dim() >= 2 else 1
-            sample_losses: List[torch.Tensor] = []
-            if train:
-                optimizer.zero_grad()
             with torch.set_grad_enabled(train):
-                for sample_idx, (vid, frame_idx) in enumerate(zip(video_ids_list, frame_indices_list)):
-                    obs_seq = observations[sample_idx : sample_idx + 1]
-                    agent_action_cpu = agent_action_list[sample_idx]
-                    agent_action = {
-                        key: agent_action_cpu[key].unsqueeze(0).to(device, non_blocking=True)
-                        for key in agent_action_cpu.keys()
-                    }
-                    cached_state = state_cache.get(int(vid))
-                    new_episode = cached_state is None
-                    if new_episode:
-                        state_in = _move_state_to_device(model.initial_state(1))
-                    else:
-                        state_in = _move_state_to_device(cached_state)
-                    first = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
-                    if new_episode:
-                        first[:, 0] = True
-                    policy_tuple, state_out = model({"img": obs_seq}, first, state_in)
-                    pd_params = policy_tuple[0]
-                    final_pd_params = tree_map(lambda x: x[:, -1], pd_params)
-                    log_prob = model.pi_head.logprob(agent_action, final_pd_params)
-                    running_loss += (-log_prob.detach()).sum().item()
-                    running_examples += log_prob.numel()
-                    if train:
-                        sample_losses.append(-log_prob.mean())
+                state_inputs = []
+                first = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+                for idx, (vid, frame_idx) in enumerate(zip(video_ids_list, frame_indices_list)):
+                    stored_state = episode_hidden_states.get(vid)
+                    last_frame = last_seen_frame.get(vid)
+                    needs_reset = stored_state is None or last_frame is None or frame_idx <= last_frame
+                    if needs_reset:
+                        stored_state = _move_state_to_device(model.initial_state(1))
+                    if stored_state is not None:
+                        episode_hidden_states[vid] = stored_state
+                    state_inputs.append(stored_state)
+                    if needs_reset:
+                        first[idx, 0] = True
+                state_in = _stack_states_for_batch(state_inputs)
+                obs_dict = {"img": observations}
+                policy_tuple, state_out = model(obs_dict, first, state_in)
+                pd_params = policy_tuple[0]
+                final_pd_params = tree_map(lambda x: x[:, -1], pd_params)
+                log_prob = model.pi_head.logprob(agent_actions, final_pd_params)
+                loss = -log_prob.mean()
+                if train:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    optimizer.step()
+                if state_out is not None:
                     detached_state = _detach_state(state_out)
-                    state_cache[int(vid)] = _move_state_to_device(detached_state)
-            if train and sample_losses:
-                batch_loss = torch.stack(sample_losses).mean()
-                batch_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                optimizer.step()
+                    for idx, vid in enumerate(video_ids_list):
+                        episode_hidden_states[vid] = _slice_state(detached_state, idx)
+                for vid, frame_idx in zip(video_ids_list, frame_indices_list):
+                    last_seen_frame[vid] = frame_idx
+            running_loss += (-log_prob.detach()).sum().item()
+            running_examples += log_prob.numel()
             if running_examples > 0:
                 iterator.set_postfix(
                     loss=f"{running_loss / running_examples:.4f}",
@@ -525,6 +347,7 @@ def train_vpt_bc(
         return running_loss / running_examples, {}
 
     for epoch in range(train_epochs):
+        train_batch_sampler.set_epoch(epoch)
         train_loss, _ = run_epoch(loader, train=True)
         if len(val_subset) > 0:
             val_loss, _ = run_epoch(val_loader, train=False)

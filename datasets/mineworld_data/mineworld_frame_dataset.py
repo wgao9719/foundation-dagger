@@ -41,7 +41,7 @@ class MineWorldFrameDataset(Dataset):
     def __init__(
         self,
         data_root: Path,
-        context_frames: int = 1,
+        context_frames: int = 8,
         recursive: bool = True,
         max_open_captures: int = 2,
     ) -> None:

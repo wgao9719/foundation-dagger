@@ -3,20 +3,23 @@
 The script ingests MineWorld-style trajectories (paired ``.mp4`` videos and
 ``.jsonl`` action logs) and produces a supervised policy checkpoint compatible
 with the ``foundation_dagger`` module. Each training sample stacks the full
-``N``-frame context window and predicts the action token sequence associated
-with the final frame, enabling Transformer-style policies to leverage temporal
-attention while still supporting single-frame heads. Only a user-specified
-fraction of the available samples is used to keep the bootstrap stage quick.
+``N``-frame context window and maximises the joint log-likelihood of the final
+frame's hierarchical action under the VPT policy head, enabling
+Transformer-style policies to leverage temporal attention while still
+supporting single-frame heads. Only a user-specified fraction of the available
+samples is used to keep the bootstrap stage quick.
 
 Example
 -------
-python scripts/train_initial_bc.py \
-    --dataset mineworld_frames \
-    --data-root /Users/willi1/foundation-dagger/diffusion-forcing-transformer/data/mineworld \
-    --fraction 0.1 \
-    --epochs 10 \
-    --batch-size 32 \
-    --output checkpoints/bc_policy.ckpt
+python -m scripts.train_vpt \
+  --algorithm vpt_bc
+  --dataset mineworld_frames \
+  --experiment mineworld_bc_train \
+  --data-root /workspace/foundation-dagger/foundation-dagger/data/mineworld \
+  --fraction 0.3 \
+  --epochs 20 \
+  --batch-size 32 \
+  --output checkpoints/bc_checkpoints/bc_policy.ckpt
 """
 
 
@@ -27,14 +30,16 @@ import random
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional
+from gym3.types import DictType
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 import wandb
@@ -50,14 +55,14 @@ CONFIG_DIR = ROOT_DIR / "configurations"
 from algorithms.foundation_dagger.vpt_model.policy import MinecraftAgentPolicy
 from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
 from algorithms.foundation_dagger.vpt_model.load_vpt_config import VPTConfig, parse_policy_config
-
-IGNORE_INDEX = -100
+from algorithms.foundation_dagger.vpt_model.tree_util import tree_map, tree_multimap
+from algorithms.foundation_dagger.vpt_model.actions import ActionTransformer, Buttons
 
 
 def _load_hydra_configs(
-    dataset_name: str = "mineworld_frames",
-    algorithm_name: str = "mineworld_bc",
-    experiment_name: str = "mineworld_bc_train"
+    dataset_name: str,
+    algorithm_name: str,
+    experiment_name: str,
 ) -> tuple[dict, dict, dict]:
     overrides: list[str] = []
     if dataset_name:
@@ -73,11 +78,11 @@ def _load_hydra_configs(
         cfg = compose(config_name="config", overrides=overrides)
 
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
-    policy_cfg = OmegaConf.to_container(cfg.algorithm.policy, resolve=True)
+    policy_cfg = OmegaConf.to_container(cfg.algorithm, resolve=True)
     exp_cfg = OmegaConf.to_container(cfg.experiment, resolve=True)
     return dataset_cfg, policy_cfg, exp_cfg
 
-def train_initial_bc(
+def train_vpt_bc(
     data_root: Path,
     fraction: float,
     epochs: int,
@@ -103,7 +108,6 @@ def train_initial_bc(
         recursive=recursive,
         max_open_captures=int(dataset_cfg.get("max_open_captures", 2)),
     )
-
     train_cfg = exp_cfg.get("training", {})
     opt_cfg = exp_cfg.get("optimizer", {})
 
@@ -144,15 +148,8 @@ def train_initial_bc(
     val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
     checkpoint_interval = int(train_cfg.get("checkpoint_interval", 0))
-    grad_clip_norm_raw = train_cfg.get("grad_clip_norm", 1.0)
-    grad_clip_norm: Optional[float]
-    try:
-        grad_clip_norm = float(grad_clip_norm_raw)
-    except (TypeError, ValueError):
-        grad_clip_norm = None
-    if grad_clip_norm is not None and grad_clip_norm <= 0:
-        grad_clip_norm = None
-
+    grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
+    
     # initialize wandb
     wandb.init(
         project="foundation-dagger",
@@ -169,7 +166,6 @@ def train_initial_bc(
             "resize": resize,
             "val_fraction": val_fraction,
             "seed": random_seed,
-            "policy_output_dim": policy_cfg.action_dim,
             "train_samples": len(train_subset),
             "val_samples": len(val_subset),
             "grad_clip_norm": grad_clip_norm if grad_clip_norm is not None else 0.0,
@@ -190,11 +186,30 @@ def train_initial_bc(
     loader = DataLoader(train_subset, **loader_kwargs)
 
     # initialize model
-    action_space = CameraHierarchicalMapping(n_camera_bins=11)
-    policy_kwargs = policy_cfg.model.args.net.args
-    pi_head_kwargs = policy_cfg.model.pi_head_opts
-    model = MinecraftAgentPolicy(action_space,policy_kwargs, pi_head_kwargs)
+    action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
+    action_space = action_mapper.get_action_space_update()
+    action_space = DictType(**action_space)
+
+    model_args = policy_cfg.model.get("args", {})
+    policy_kwargs = model_args.get("net", {}).get("args", {})
+    pi_head_kwargs = model_args.get("pi_head_opts", {})
+
+    model = MinecraftAgentPolicy(action_space, policy_kwargs, pi_head_kwargs)
+
+    # initialize weights
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # path = "/Users/willi1/foundation-dagger/diffusion-forcing-transformer/checkpoints/vpt/foundation-model-1x.weights"
+    path = "/workspace/foundation-dagger/foundation-dagger/checkpoints/vpt/foundation-model-1x.weights"
+    # model.load_state_dict(torch.load(path, map_location=device), strict=False)
+    state_dict = torch.load(path, map_location=device)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys or unexpected_keys:
+        warn_lines = ["VPT checkpoint load was non-strict:"]
+        if missing_keys:
+            warn_lines.append(f"  missing keys ({len(missing_keys)}): {sorted(missing_keys)[:10]}{' ...' if len(missing_keys) > 10 else ''}")
+        if unexpected_keys:
+            warn_lines.append(f"  unexpected keys ({len(unexpected_keys)}): {sorted(unexpected_keys)[:10]}{' ...' if len(unexpected_keys) > 10 else ''}")
+        print("\n".join(warn_lines))
     model = model.to(device)
 
     def _move_state_to_device(state):
@@ -203,6 +218,23 @@ def train_initial_bc(
         if isinstance(state, (list, tuple)):
             return type(state)(_move_state_to_device(s) for s in state)
         return state.to(device, non_blocking=True)
+
+    def _stack_states_for_batch(state_list):
+        if not state_list or state_list[0] is None:
+            return None
+        if len(state_list) == 1:
+            return state_list[0]
+        return tree_multimap(lambda *xs: torch.cat(xs, dim=0), state_list[0], *state_list[1:])
+
+    def _slice_state(state, index):
+        if state is None:
+            return None
+        return tree_map(lambda x: x[index : index + 1].detach().clone(), state)
+
+    def _detach_state(state):
+        if state is None:
+            return None
+        return tree_map(lambda x: x.detach(), state)
 
     def save_checkpoint(suffix: str | None = None) -> Path:
         if suffix:
@@ -240,17 +272,13 @@ def train_initial_bc(
             model.train()
         else:
             model.eval()
-        iterator = tqdm(
-            data_loader,
-            desc="train" if train else "val",
-            leave=False,
-            ncols=80,
-        )
+
+        iterator = tqdm(data_loader, desc="train" if train else "val", leave=False, ncols=80)
+        episode_hidden_states: Dict[int, Any] = {}
+        last_seen_frame: Dict[int, int] = {}
+
         for batch in iterator:
-            if isinstance(batch, (tuple, list)) and len(batch) == 4:
-                observations, _, video_ids, frame_indices = batch
-            else:
-                raise ValueError("MineWorldFrameDataset must return (frames, labels, video_ids, frame_indices)")
+            observations, _, video_ids, frame_indices = batch
             observations = observations.to(device, non_blocking=True).contiguous()
             video_ids_list = video_ids.cpu().tolist()
             frame_indices_list = frame_indices.cpu().tolist()
@@ -264,20 +292,39 @@ def train_initial_bc(
                 for key in action_keys
             }
             batch_size = observations.size(0)
+            seq_len = observations.size(1) if observations.dim() >= 2 else 1
             with torch.set_grad_enabled(train):
-                state_in = _move_state_to_device(model.initial_state(batch_size))
-                first = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                state_inputs = []
+                first = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+                for idx, (vid, frame_idx) in enumerate(zip(video_ids_list, frame_indices_list)):
+                    stored_state = episode_hidden_states.get(vid)
+                    last_frame = last_seen_frame.get(vid)
+                    needs_reset = stored_state is None or last_frame is None or frame_idx <= last_frame
+                    if needs_reset:
+                        stored_state = _move_state_to_device(model.initial_state(1))
+                    if stored_state is not None:
+                        episode_hidden_states[vid] = stored_state
+                    state_inputs.append(stored_state)
+                    if needs_reset:
+                        first[idx, 0] = True
+                state_in = _stack_states_for_batch(state_inputs)
                 obs_dict = {"img": observations}
-                policy_tuple, _ = model(obs_dict, first, state_in)
+                policy_tuple, state_out = model(obs_dict, first, state_in)
                 pd_params = policy_tuple[0]
-                log_prob = model.get_logprob_of_action(pd_params, agent_actions)
+                final_pd_params = tree_map(lambda x: x[:, -1], pd_params)
+                log_prob = model.pi_head.logprob(agent_actions, final_pd_params)
                 loss = -log_prob.mean()
                 if train:
                     optimizer.zero_grad()
                     loss.backward()
-                    if grad_clip_norm is not None:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     optimizer.step()
+                if state_out is not None:
+                    detached_state = _detach_state(state_out)
+                    for idx, vid in enumerate(video_ids_list):
+                        episode_hidden_states[vid] = _slice_state(detached_state, idx)
+                for vid, frame_idx in zip(video_ids_list, frame_indices_list):
+                    last_seen_frame[vid] = frame_idx
             running_loss += (-log_prob.detach()).sum().item()
             running_examples += log_prob.numel()
             if running_examples > 0:
@@ -303,7 +350,7 @@ def train_initial_bc(
         if val_loss is not None:
             print(
                 f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} "
-                f"- val_loss: {val_loss:.4f} "
+                f"- val_loss: {val_loss:.4f}"
             )
         else:
             print(
@@ -439,7 +486,7 @@ if __name__ == "__main__":
     if args.no_recursive:
         recursive = False
 
-    train_initial_bc(
+    train_vpt_bc(
         data_root=data_root,
         fraction=fraction,
         epochs=epochs,

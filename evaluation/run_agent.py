@@ -3,7 +3,7 @@ import pickle
 
 import minerl
 from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
-import gymnasium as gym
+import gym as gym
 
 from evaluation.agent import MineRLAgent, ENV_KWARGS
 
