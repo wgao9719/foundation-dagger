@@ -99,6 +99,7 @@ def train_vpt_bc(
     experiment_name: str,
     dataset_name: str,
     exp_cfg: Dict,
+    label_smoothing: Optional[float],
 ) -> None:
     # get configs
     policy_cfg: VPTConfig = parse_policy_config(policy_cfg_dict)
@@ -113,9 +114,10 @@ def train_vpt_bc(
     train_cfg = exp_cfg.get("training", {})
     opt_cfg = exp_cfg.get("optimizer", {})
 
-    # get subset length and indices
-    subset_len = max(1, int(len(dataset) * fraction))
-    indices = list(range(len(dataset)))
+    total_samples = len(dataset)
+    if total_samples == 0:
+        raise ValueError(f"No samples found under {data_root}")
+    subset_len = max(1, int(total_samples * fraction))
     random_seed = int(train_cfg.get("seed", dataset_cfg.get("seed", 0)))
     random.seed(random_seed)
 
@@ -124,24 +126,43 @@ def train_vpt_bc(
     for idx, (_, vid, _) in enumerate(dataset.samples):
         video_to_indices.setdefault(int(vid), []).append(idx)
     video_ids = list(video_to_indices.keys())
+    if len(video_ids) < 2:
+        raise ValueError(
+            "Need at least two trajectories to reserve one for validation while keeping the rest for training."
+        )
     random.shuffle(video_ids)
-    indices = []
-    for vid in video_ids:
-        indices.extend(video_to_indices[vid])
 
-    # split dataset into training and validation
-    val_fraction = float(train_cfg.get("val_fraction", dataset_cfg.get("val_fraction", 0.1)))
-    if subset_len <= 1 or val_fraction <= 0:
-        val_fraction = 0.0
-        val_split = 0
-    else:
-        val_split = max(1, int(round(subset_len * val_fraction)))
-        if val_split >= subset_len:
-            val_split = max(1, subset_len - 1)
-    val_indices = indices[:val_split]
-    train_indices = indices[val_split:subset_len]
+    # Reserve exactly one entire trajectory for validation; keep remaining
+    # whole trajectories for training while respecting the fraction budget at
+    # the granularity of complete videos.
+    val_video_id = video_ids[0]
+    train_candidate_videos = video_ids[1:]
+    if not train_candidate_videos:
+        raise ValueError(
+            "Need at least two trajectories to create a train/val split that preserves full videos."
+        )
+
+    val_indices = list(video_to_indices[val_video_id])
+    target_train_samples = max(0, subset_len - len(val_indices))
+    limit_train_subset = fraction < 1.0
+    train_indices: List[int] = []
+    selected_train_videos: List[int] = []
+    for vid in train_candidate_videos:
+        if limit_train_subset and target_train_samples <= 0 and selected_train_videos:
+            break
+        train_indices.extend(video_to_indices[vid])
+        selected_train_videos.append(vid)
+        target_train_samples -= len(video_to_indices[vid])
+    if not train_indices:
+        # Fall back to the first remaining trajectory so training is non-empty.
+        first_vid = train_candidate_videos[0]
+        train_indices = list(video_to_indices[first_vid])
+        selected_train_videos = [first_vid]
+
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
+    effective_total = max(1, len(train_indices) + len(val_indices))
+    val_fraction = len(val_indices) / effective_total
 
     train_video_to_positions: Dict[int, List[int]] = {}
     for subset_idx, dataset_idx in enumerate(train_indices):
@@ -154,10 +175,17 @@ def train_vpt_bc(
     train_workers = int(train_cfg.get("num_workers", 4))
     val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
-    checkpoint_interval = int(train_cfg.get("checkpoint_interval", 0))
+    checkpoint_interval = int(train_cfg.get("checkpoint_interval", 1))
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
     
     # initialize wandb
+    train_label_smoothing = train_cfg.get("label_smoothing", label_smoothing)
+    if train_label_smoothing is None:
+        train_label_smoothing = 0.0
+    train_label_smoothing = float(train_label_smoothing)
+    if not 0.0 <= train_label_smoothing < 1.0:
+        raise ValueError("label_smoothing must be in [0, 1).")
+
     wandb.init(
         project="foundation-dagger",
         job_type="bc-bootstrap",
@@ -176,6 +204,7 @@ def train_vpt_bc(
             "train_samples": len(train_subset),
             "val_samples": len(val_subset),
             "grad_clip_norm": grad_clip_norm if grad_clip_norm is not None else 0.0,
+            "label_smoothing": train_label_smoothing,
         },
     )
 
@@ -277,6 +306,17 @@ def train_vpt_bc(
         val_loader_kwargs["prefetch_factor"] = max(val_prefetch_factor, 1)
     val_loader = DataLoader(val_subset, **val_loader_kwargs)
 
+    def _uniform_logprob_bonus(pd_params: Dict[str, torch.Tensor], base: torch.Tensor) -> torch.Tensor:
+        # Computes the uniform-distribution expectation of the log probs for categorical heads.
+        bonus = torch.zeros_like(base)
+        for key in ("buttons", "camera"):
+            logits = pd_params.get(key)
+            if logits is None:
+                continue
+            reshaped = logits.reshape(logits.shape[0], -1, logits.shape[-1])
+            bonus = bonus + reshaped.mean(dim=-1).sum(dim=-1)
+        return bonus
+
     def run_epoch(data_loader, train: bool):
         running_loss = 0.0
         running_examples = 0
@@ -293,6 +333,7 @@ def train_vpt_bc(
         overlap_resets = 0
         stride_sum = 0.0
         stride_count = 0
+        running_kl = 0.0
         if train:
             model.train()
         else:
@@ -352,6 +393,12 @@ def train_vpt_bc(
                 extra_outputs = policy_tuple[2] or {}
                 final_pd_params = tree_map(lambda x: x[:, -1], pd_params)
                 log_prob = model.pi_head.logprob(policy_actions, final_pd_params)
+                uniform_bonus = None
+                if train_label_smoothing > 0.0:
+                    uniform_bonus = _uniform_logprob_bonus(final_pd_params, log_prob)
+                    smoothed_log_prob = (1.0 - train_label_smoothing) * log_prob + train_label_smoothing * uniform_bonus
+                else:
+                    smoothed_log_prob = log_prob
                 pred_buttons = torch.argmax(final_pd_params["buttons"], dim=-1)
                 pred_camera = torch.argmax(final_pd_params["camera"], dim=-1)
                 target_buttons = policy_actions["buttons"]
@@ -375,7 +422,8 @@ def train_vpt_bc(
                 entropy_per_sample = entropy_values.reshape(entropy_values.shape[0], -1).mean(dim=1)
                 entropy_sum += entropy_per_sample.detach().sum().item()
                 entropy_count += entropy_per_sample.numel()
-                loss = -log_prob.mean() + esc_loss
+                per_sample_loss = -smoothed_log_prob
+                loss = per_sample_loss.mean() + esc_loss
                 if train:
                     optimizer.zero_grad()
                     loss.backward()
@@ -388,9 +436,10 @@ def train_vpt_bc(
                 for vid, frame_idx in zip(video_ids_list, frame_indices_list):
                     last_seen_frame[vid] = frame_idx
             total_samples += batch_size
-            running_loss += (-log_prob.detach()).sum().item()
+            running_loss += per_sample_loss.detach().sum().item()
+            running_kl += (-log_prob.detach()).sum().item()
             running_examples += log_prob.numel()
-            if running_examples > 0:
+        if running_examples > 0:
                 iterator.set_postfix(
                     loss=f"{running_loss / running_examples:.4f}",
                 )
@@ -401,6 +450,7 @@ def train_vpt_bc(
             metrics["accuracy_camera"] = correct_camera / total_samples
             metrics["reset_fraction"] = reset_events / total_samples
             metrics["overlap_reset_fraction"] = overlap_resets / total_samples
+            metrics["kl_divergence"] = running_kl / total_samples
         if stride_count > 0:
             metrics["avg_stride"] = stride_sum / stride_count
         if esc_examples > 0:
@@ -514,6 +564,12 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs") / "bootstrap_bc.ckpt",
         help="Path to save the trained checkpoint.",
     )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=None,
+        help="Label smoothing coefficient for BC loss (overrides config).",
+    )
     return parser.parse_args()
 
 
@@ -583,4 +639,5 @@ if __name__ == "__main__":
         experiment_name=experiment_name,
         dataset_name=dataset_name,
         exp_cfg=exp_cfg,
+        label_smoothing=args.label_smoothing,
     )
