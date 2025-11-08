@@ -58,6 +58,7 @@ from algorithms.foundation_dagger.vpt_model.policy import MinecraftAgentPolicy
 from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
 from algorithms.foundation_dagger.vpt_model.load_vpt_config import VPTConfig, parse_policy_config
 from algorithms.foundation_dagger.vpt_model.tree_util import tree_map, tree_multimap
+from algorithms.foundation_dagger.vpt_model.actions import Buttons
 
 from utils.SequentialBatchSampler import PerVideoSequentialBatchSampler
 
@@ -230,6 +231,12 @@ def train_vpt_bc(
     action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
     action_space = action_mapper.get_action_space_update()
     action_space = DictType(**action_space)
+    button_idx_to_factored = torch.from_numpy(action_mapper.BUTTON_IDX_TO_FACTORED).long()
+    button_idx_to_camera_meta_off = torch.from_numpy(action_mapper.BUTTON_IDX_TO_CAMERA_META_OFF).bool()
+    camera_idx_to_factored = torch.from_numpy(action_mapper.CAMERA_IDX_TO_FACTORED).long()
+    camera_null_bin = action_mapper.camera_null_bin
+    num_buttons = len(Buttons.ALL)
+    num_camera_bins = action_mapper.n_camera_bins
 
     model_args = policy_cfg.model.get("args", {})
     policy_kwargs = model_args.get("net", {}).get("args", {})
@@ -334,6 +341,13 @@ def train_vpt_bc(
         stride_sum = 0.0
         stride_count = 0
         running_kl = 0.0
+        running_kl_sq = 0.0
+        button_tp = torch.zeros(num_buttons, dtype=torch.float64)
+        button_fp = torch.zeros(num_buttons, dtype=torch.float64)
+        button_fn = torch.zeros(num_buttons, dtype=torch.float64)
+        camera_tp = torch.zeros((2, num_camera_bins), dtype=torch.float64)
+        camera_fp = torch.zeros((2, num_camera_bins), dtype=torch.float64)
+        camera_fn = torch.zeros((2, num_camera_bins), dtype=torch.float64)
         if train:
             model.train()
         else:
@@ -423,7 +437,7 @@ def train_vpt_bc(
                 entropy_sum += entropy_per_sample.detach().sum().item()
                 entropy_count += entropy_per_sample.numel()
                 per_sample_loss = -smoothed_log_prob
-                loss = per_sample_loss.mean() + esc_loss
+                loss = per_sample_loss.mean() + 0.5 * esc_loss
                 if train:
                     optimizer.zero_grad()
                     loss.backward()
@@ -435,9 +449,40 @@ def train_vpt_bc(
                         episode_hidden_states[vid] = _slice_state(detached_state, idx)
                 for vid, frame_idx in zip(video_ids_list, frame_indices_list):
                     last_seen_frame[vid] = frame_idx
+                pred_button_idx = pred_buttons.view(-1).to("cpu").long()
+                target_button_idx = target_buttons.view(-1).to("cpu").long()
+                pred_button_factored = button_idx_to_factored[pred_button_idx]
+                target_button_factored = button_idx_to_factored[target_button_idx]
+                button_tp += ((pred_button_factored == 1) & (target_button_factored == 1)).sum(dim=0).to(torch.float64)
+                button_fp += ((pred_button_factored == 1) & (target_button_factored == 0)).sum(dim=0).to(torch.float64)
+                button_fn += ((pred_button_factored == 0) & (target_button_factored == 1)).sum(dim=0).to(torch.float64)
+
+                pred_camera_idx = pred_camera.view(-1).to("cpu").long()
+                target_camera_idx = target_camera.view(-1).to("cpu").long()
+                pred_camera_bins = camera_idx_to_factored[pred_camera_idx].clone()
+                target_camera_bins = camera_idx_to_factored[target_camera_idx].clone()
+                pred_camera_off = button_idx_to_camera_meta_off[pred_button_idx]
+                target_camera_off = button_idx_to_camera_meta_off[target_button_idx]
+                pred_camera_bins[pred_camera_off] = camera_null_bin
+                target_camera_bins[target_camera_off] = camera_null_bin
+                for axis in range(2):
+                    preds_axis = pred_camera_bins[:, axis]
+                    targets_axis = target_camera_bins[:, axis]
+                    for bin_idx in range(num_camera_bins):
+                        pred_match = preds_axis == bin_idx
+                        target_match = targets_axis == bin_idx
+                        tp = (pred_match & target_match).sum().to(torch.float64)
+                        fp = (pred_match & (~target_match)).sum().to(torch.float64)
+                        fn = ((~pred_match) & target_match).sum().to(torch.float64)
+                        camera_tp[axis, bin_idx] += tp
+                        camera_fp[axis, bin_idx] += fp
+                        camera_fn[axis, bin_idx] += fn
+
             total_samples += batch_size
+            per_sample_kl = (-log_prob.detach()).double()
             running_loss += per_sample_loss.detach().sum().item()
-            running_kl += (-log_prob.detach()).sum().item()
+            running_kl += per_sample_kl.sum().item()
+            running_kl_sq += (per_sample_kl ** 2).sum().item()
             running_examples += log_prob.numel()
         if running_examples > 0:
                 iterator.set_postfix(
@@ -450,7 +495,6 @@ def train_vpt_bc(
             metrics["accuracy_camera"] = correct_camera / total_samples
             metrics["reset_fraction"] = reset_events / total_samples
             metrics["overlap_reset_fraction"] = overlap_resets / total_samples
-            metrics["kl_divergence"] = running_kl / total_samples
         if stride_count > 0:
             metrics["avg_stride"] = stride_sum / stride_count
         if esc_examples > 0:
@@ -458,6 +502,26 @@ def train_vpt_bc(
             metrics["accuracy_esc"] = correct_esc / esc_examples
         if entropy_count > 0:
             metrics["entropy"] = entropy_sum / entropy_count
+        if running_examples > 0:
+            kl_mean = running_kl / running_examples
+            metrics["kl_divergence_mean"] = kl_mean
+            metrics["kl_divergence_sum"] = running_kl
+            kl_var = max(running_kl_sq / running_examples - kl_mean ** 2, 0.0)
+            metrics["kl_divergence_std"] = math.sqrt(kl_var)
+            eps = 1e-8
+            button_precision = button_tp / (button_tp + button_fp + eps)
+            button_recall = button_tp / (button_tp + button_fn + eps)
+            button_f1 = 2 * button_precision * button_recall / (button_precision + button_recall + eps)
+            for idx, name in enumerate(Buttons.ALL):
+                metrics[f"f1/button_{name.replace('.', '_')}"] = button_f1[idx].item()
+            camera_precision = camera_tp / (camera_tp + camera_fp + eps)
+            camera_recall = camera_tp / (camera_tp + camera_fn + eps)
+            camera_f1 = 2 * camera_precision * camera_recall / (camera_precision + camera_recall + eps)
+            for axis_idx, axis_name in enumerate(("x", "y")):
+                axis_macro = camera_f1[axis_idx].mean().item()
+                metrics[f"f1/camera_{axis_name}_macro"] = axis_macro
+                for bin_idx in range(num_camera_bins):
+                    metrics[f"f1/camera_{axis_name}_bin_{bin_idx}"] = camera_f1[axis_idx, bin_idx].item()
         if running_examples == 0:
             return 0.0, metrics
         return running_loss / running_examples, metrics
