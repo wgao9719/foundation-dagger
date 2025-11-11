@@ -1,25 +1,32 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
-from typing import List, Literal, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Callable, Literal, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import models
 
 
+def _camel_case(name: str) -> str:
+    return "".join(part.capitalize() for part in name.split("_"))
+
 def _resolve_resnet(name: str, pretrained: bool) -> nn.Module:
-    name = name.lower()
+    normalized = name.lower()
     weights = None
-    if pretrained:
-        weight_enum = getattr(models, f"{name}_Weights", None)
-        if weight_enum is not None:
-            weights = weight_enum.DEFAULT
-    if not hasattr(models, name):
+    if not hasattr(models, normalized):
         raise ValueError(f"Unsupported torchvision backbone '{name}'.")
-    backbone = getattr(models, name)(weights=weights)
+    if pretrained:
+        weight_attr_candidates = (
+            f"{normalized}_Weights",
+            f"{_camel_case(normalized)}_Weights",
+        )
+        for attr in weight_attr_candidates:
+            weight_enum = getattr(models, attr, None)
+            if weight_enum is not None:
+                weights = weight_enum.DEFAULT
+                break
+    backbone = getattr(models, normalized)(weights=weights)
     return backbone
 
 
@@ -57,47 +64,98 @@ class SimpleVisionBackbone(nn.Module):
             feats = self.project(feats)
         return feats
 
+class TemporalEncoder(nn.Module):
+    """Turns per-frame features into per-step temporal features."""
+    def __init__(self, dim: int, n_layers: int = 2, n_heads: int = 4, seq_dropout: float = 0.0):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=dim, nhead=n_heads, batch_first=True)
+        self.enc = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.drop = nn.Dropout(seq_dropout)
 
-class PolicyHead(nn.Module):
-    """
-    Lightweight MLP with GELU activations for policy logits.
-    """
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x: [B, T, D]
+        x = self.enc(x, src_key_padding_mask=attn_mask)  # attn_mask: True for PAD
+        return self.drop(x)
 
+@dataclass
+class ActionHeadConfig:
+    # buttons: either categorical over combos OR multi-label bits
+    buttons_classes: int                     # e.g., num combo ids (recommended)
+    camera_bins: int = 11                    # per-axis bins (e.g., 11)
+    use_camera_gate: bool = True             # predict "camera active?" bit
+    buttons_multilabel: bool = False         # set True if you want BCE per button bit
+
+def _default_action_head_cfg() -> "ActionHeadConfig":
+    # Import lazily to avoid adding a hard dependency on gym3 during lightweight usage.
+    buttons_classes = 80
+    try:
+        from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
+
+        buttons_classes = len(CameraHierarchicalMapping.BUTTONS_COMBINATIONS)
+    except Exception:
+        pass
+    return ActionHeadConfig(buttons_classes=buttons_classes, camera_bins=11, use_camera_gate=True)
+
+def _get_activation(name: Literal["gelu", "relu"]) -> Callable[[], nn.Module]:
+    lowered = name.lower()
+    if lowered == "gelu":
+        return nn.GELU
+    if lowered == "relu":
+        return lambda: nn.ReLU(inplace=True)
+    raise ValueError(f"Unsupported activation '{name}'")
+
+
+class ActionHead(nn.Module):
     def __init__(
         self,
         input_dim: int,
         hidden_dim: int,
-        action_dim: int,
-        layers: int = 4,
+        cfg: ActionHeadConfig,
+        layers: int = 2,
         dropout: float = 0.0,
         activation: Literal["gelu", "relu"] = "gelu",
-    ) -> None:
+    ):
         super().__init__()
-        activation_layer = nn.GELU if activation == "gelu" else nn.ReLU
-        mlp: list[nn.Module] = []
-        in_dim = input_dim
+        act_factory = _get_activation(activation)
+        # shared MLP trunk
+        trunk = []
+        d = input_dim
         for _ in range(layers - 1):
-            mlp.append(nn.Linear(in_dim, hidden_dim))
-            mlp.append(activation_layer())
+            trunk += [nn.Linear(d, hidden_dim), act_factory()]
             if dropout > 0:
-                mlp.append(nn.Dropout(dropout))
-            in_dim = hidden_dim
-        mlp.append(nn.Linear(in_dim, action_dim))
-        self.net = nn.Sequential(*mlp)
+                trunk += [nn.Dropout(dropout)]
+            d = hidden_dim
+        self.trunk = nn.Sequential(*trunk) if trunk else nn.Identity()
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.net(features)
+        # heads
+        self.buttons = nn.Linear(d or input_dim, cfg.buttons_classes if not cfg.buttons_multilabel else cfg.buttons_classes)
+        self.cam_x   = nn.Linear(d or input_dim, cfg.camera_bins)
+        self.cam_y   = nn.Linear(d or input_dim, cfg.camera_bins)
+        self.gate    = nn.Linear(d or input_dim, 2) if cfg.use_camera_gate else None
+        self.cfg     = cfg
+
+    def forward(self, h: torch.Tensor) -> dict[str, torch.Tensor]:
+        # h: [B, T, D]
+        z = self.trunk(h)
+        buttons_logits = self.buttons(z)
+        cam_x_logits = self.cam_x(z)
+        cam_y_logits = self.cam_y(z)
+        camera_joint = (
+            cam_x_logits.unsqueeze(-1) + cam_y_logits.unsqueeze(-2)
+        ).reshape(z.shape[0], z.shape[1], -1)
+        out = {
+            "buttons": buttons_logits,    # [B, T, C] (or bits)
+            "camera_x": cam_x_logits,     # [B, T, n_bins]
+            "camera_y": cam_y_logits,     # [B, T, n_bins]
+            "camera": camera_joint,       # [B, T, n_bins^2]
+        }
+        if self.cfg.use_camera_gate:
+            out["camera_gate"] = self.gate(z)    # [B, T, 2]
+        return out
 
 
 @dataclass
-class BasePolicyConfig:
-    type: Literal["mlp", "vpt_causal"] = "mlp"
-    action_dim: int = 4
-
-
-@dataclass
-class PolicyConfig(BasePolicyConfig):
-    type: Literal["mlp"] = "mlp"
+class PolicyConfig:
     backbone: str = "resnet50"
     pretrained_backbone: bool = True
     backbone_trainable: bool = True
@@ -107,21 +165,10 @@ class PolicyConfig(BasePolicyConfig):
     dropout: float = 0.0
     activation: Literal["gelu", "relu"] = "gelu"
 
-
-@dataclass
-class VPTPolicyConfig(BasePolicyConfig):
-    type: Literal["vpt_causal"] = "vpt_causal"
-    backbone: str = "resnet50"
-    pretrained_backbone: bool = True
-    backbone_trainable: bool = True
-    embed_dim: int = 768
-    ffn_dim: int = 2048
-    n_layers: int = 6
-    n_heads: int = 8
-    dropout: float = 0.1
-    attn_dropout: float = 0.1
-    mem_len: int = 64
-    layer_norm_eps: float = 1e-5
+    # temporal_layers: int = 2
+    # temporal_heads: int = 4
+    # temporal_dropout: float = 0.0
+    action: ActionHeadConfig = field(default_factory=_default_action_head_cfg)
 
 
 class FoundationBCPolicy(nn.Module):
@@ -138,358 +185,30 @@ class FoundationBCPolicy(nn.Module):
             trainable=cfg.backbone_trainable,
             out_dim=cfg.backbone_dim,
         )
-        head_input = cfg.backbone_dim or self.encoder.feature_dim
-        self.policy = PolicyHead(
-            input_dim=head_input,
+        feat_dim = cfg.backbone_dim or self.encoder.feature_dim
+        # self.temporal = TemporalEncoder(
+        #     dim=feat_dim,
+        #     n_layers=cfg.temporal_layers,
+        #     n_heads=cfg.temporal_heads,
+        #     seq_dropout=cfg.temporal_dropout,
+        # )
+        self.action_head = ActionHead(
+            input_dim=feat_dim,
             hidden_dim=cfg.hidden_dim,
-            action_dim=cfg.action_dim,
+            cfg=cfg.action,
             layers=cfg.head_layers,
             dropout=cfg.dropout,
             activation=cfg.activation,
         )
-        self.camera_gate = nn.Linear(head_input, 1)
 
-    def forward(
-        self,
-        frames: torch.Tensor,
-        return_gate: bool = False,
-        **_: object,
-    ):
-        if frames.dim() == 5:
-            frames = frames[:, -1]
-        elif frames.dim() != 4:
-            raise ValueError("Expected input of shape (B, C, H, W) or (B, T, C, H, W).")
-        features = self.encoder(frames)
-        logits = self.policy(features)
-        if not return_gate:
-            return logits
-        gate_logits = self.camera_gate(features).squeeze(-1)
-        return logits, gate_logits
-
-
-class PositionalEmbedding(nn.Module):
-    """
-    Sinusoidal positional embeddings used for relative attention.
-    """
-
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.dim = dim
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, positions: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        sinusoid = torch.einsum("i,j->ij", positions, self.inv_freq)
-        pos_emb = torch.cat((sinusoid.sin(), sinusoid.cos()), dim=-1)
-        if pos_emb.shape[-1] < self.dim:
-            pad = pos_emb.new_zeros(pos_emb.shape[0], self.dim - pos_emb.shape[-1])
-            pos_emb = torch.cat([pos_emb, pad], dim=-1)
-        return pos_emb.to(dtype=dtype)
-
-
-def _rel_shift(x: torch.Tensor) -> torch.Tensor:
-    """
-    Perform relative shift to align relative attention logits.
-    """
-
-    bsz, n_head, qlen, klen = x.size()
-    zero_pad = x.new_zeros(bsz, n_head, qlen, 1)
-    x_padded = torch.cat([zero_pad, x], dim=3)
-    x_padded = x_padded.view(bsz, n_head, klen + 1, qlen)
-    x = x_padded[:, :, 1:].view(bsz, n_head, qlen, klen)
-    return x
-
-
-class RelMultiHeadAttention(nn.Module):
-    """
-    Multi-head attention with Transformer-XL-style relative positional encoding and memory.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_head: int,
-        attn_dropout: float = 0.1,
-        resid_dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        if d_model % n_head != 0:
-            raise ValueError("d_model must be divisible by n_head for relative attention.")
-        self.d_model = d_model
-        self.n_head = n_head
-        self.d_head = d_model // n_head
-        self.scale = 1.0 / math.sqrt(self.d_head)
-
-        head_dim = n_head * self.d_head
-        self.q_proj = nn.Linear(d_model, head_dim, bias=False)
-        self.k_proj = nn.Linear(d_model, head_dim, bias=False)
-        self.v_proj = nn.Linear(d_model, head_dim, bias=False)
-        self.r_proj = nn.Linear(d_model, head_dim, bias=False)
-        self.out_proj = nn.Linear(head_dim, d_model, bias=False)
-
-        self.attn_dropout = nn.Dropout(attn_dropout)
-        self.resid_dropout = nn.Dropout(resid_dropout)
-
-        self.r_r_bias = nn.Parameter(torch.zeros(n_head, self.d_head))
-        self.r_w_bias = nn.Parameter(torch.zeros(n_head, self.d_head))
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        pos_emb: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        mem: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        bsz, qlen, _ = x.size()
-        if mem is not None:
-            k_input = torch.cat([mem, x], dim=1)
-        else:
-            k_input = x
-        klen = k_input.size(1)
-
-        w_head_q = self.q_proj(x).view(bsz, qlen, self.n_head, self.d_head).transpose(1, 2)
-        w_head_k = self.k_proj(k_input).view(bsz, klen, self.n_head, self.d_head).transpose(1, 2)
-        w_head_v = self.v_proj(k_input).view(bsz, klen, self.n_head, self.d_head).transpose(1, 2)
-        r_head_k = self.r_proj(pos_emb).view(klen, self.n_head, self.d_head).permute(1, 0, 2)
-
-        rw_head_q = w_head_q + self.r_w_bias.unsqueeze(0).unsqueeze(2)
-        AC = torch.einsum("bnqd,bnkd->bnqk", rw_head_q, w_head_k)
-
-        rr_head_q = w_head_q + self.r_r_bias.unsqueeze(0).unsqueeze(2)
-        BD = torch.einsum("bnqd,nkd->bnqk", rr_head_q, r_head_k)
-        BD = _rel_shift(BD)
-
-        attn_score = (AC + BD) * self.scale
-
-        if attn_mask is not None:
-            finfo = torch.finfo(attn_score.dtype)
-            attn_score = attn_score.masked_fill(attn_mask, finfo.min)
-            full_mask = attn_mask.all(dim=-1, keepdim=True)
-            if full_mask.any():
-                attn_score = attn_score.masked_fill(full_mask, 0.0)
-
-        attn_prob = torch.softmax(attn_score, dim=-1)
-        attn_prob = torch.nan_to_num(attn_prob, nan=0.0, posinf=0.0, neginf=0.0)
-        attn_prob = self.attn_dropout(attn_prob)
-
-        attn_vec = torch.einsum("bnqk,bnkd->bnqd", attn_prob, w_head_v)
-        attn_vec = attn_vec.transpose(1, 2).contiguous().view(bsz, qlen, self.n_head * self.d_head)
-        attn_out = self.out_proj(attn_vec)
-        attn_out = self.resid_dropout(attn_out)
-        return attn_out
-
-
-class PositionwiseFFN(nn.Module):
-    """
-    Feed-forward network with GELU activation.
-    """
-
-    def __init__(self, d_model: int, d_inner: int, dropout: float) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(d_model, d_inner)
-        self.fc2 = nn.Linear(d_inner, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        x = self.dropout(x)
-        return x
-
-
-class TransformerXLBlock(nn.Module):
-    """
-    Residual Transformer block with causal masking and memory.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_head: int,
-        d_inner: int,
-        dropout: float,
-        attn_dropout: float,
-        mem_len: int,
-        layer_norm_eps: float = 1e-5,
-    ) -> None:
-        super().__init__()
-        self.attention = RelMultiHeadAttention(
-            d_model=d_model,
-            n_head=n_head,
-            attn_dropout=attn_dropout,
-            resid_dropout=dropout,
-        )
-        self.ffn = PositionwiseFFN(d_model=d_model, d_inner=d_inner, dropout=dropout)
-        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.mem_len = mem_len
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        pos_emb: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        mem: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        attn_input = self.norm1(x)
-        attn_out = self.attention(attn_input, pos_emb, attn_mask=attn_mask, mem=mem)
-        x = x + attn_out
-        ffn_out = self.ffn(self.norm2(x))
-        x = x + ffn_out
-        new_mem = self._update_memory(mem, x)
-        return x, new_mem
-
-    def _update_memory(
-        self,
-        mem: Optional[torch.Tensor],
-        hidden: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        if self.mem_len <= 0:
-            return None
-        sanitized_hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
-        new_mem = sanitized_hidden.detach()
-        if new_mem.size(1) > self.mem_len:
-            new_mem = new_mem[:, -self.mem_len :, :]
-        if mem is None:
-            return new_mem
-        cat = torch.cat([mem, new_mem], dim=1)
-        if cat.size(1) > self.mem_len:
-            cat = cat[:, -self.mem_len :, :]
-        return cat
-
-
-class VPTCausalPolicy(nn.Module):
-    """
-    Transformer-XL-style behavioral cloning policy inspired by VPT.
-    """
-
-    def __init__(self, cfg: VPTPolicyConfig) -> None:
-        super().__init__()
-        self.cfg = cfg
-        self.encoder = SimpleVisionBackbone(
-            name=cfg.backbone,
-            pretrained=cfg.pretrained_backbone,
-            trainable=cfg.backbone_trainable,
-            out_dim=cfg.embed_dim,
-        )
-        self.input_norm = nn.LayerNorm(cfg.embed_dim, eps=cfg.layer_norm_eps)
-        self.dropout = nn.Dropout(cfg.dropout)
-        self.positional_embedding = PositionalEmbedding(cfg.embed_dim)
-        self.layers = nn.ModuleList(
-            [
-                TransformerXLBlock(
-                    d_model=cfg.embed_dim,
-                    n_head=cfg.n_heads,
-                    d_inner=cfg.ffn_dim,
-                    dropout=cfg.dropout,
-                    attn_dropout=cfg.attn_dropout,
-                    mem_len=cfg.mem_len,
-                    layer_norm_eps=cfg.layer_norm_eps,
-                )
-                for _ in range(cfg.n_layers)
-            ]
-        )
-        self.final_norm = nn.LayerNorm(cfg.embed_dim, eps=cfg.layer_norm_eps)
-        self.policy = nn.Linear(cfg.embed_dim, cfg.action_dim)
-        self.camera_gate_head = nn.Linear(cfg.embed_dim, 1)
-
-    def _causal_mask(self, qlen: int, mlen: int, device: torch.device) -> Optional[torch.Tensor]:
-        if qlen <= 0:
-            return None
-        future_mask = torch.triu(
-            torch.ones(qlen, qlen, device=device, dtype=torch.bool),
-            diagonal=1,
-        )
-        if mlen > 0:
-            mem_mask = torch.zeros(qlen, mlen, device=device, dtype=torch.bool)
-            mask = torch.cat([mem_mask, future_mask], dim=1)
-        else:
-            mask = future_mask
-        return mask.unsqueeze(0).unsqueeze(1)
-
-    def _encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
-        bsz, seq_len, c, h, w = frames.shape
-        flat_frames = frames.reshape(bsz * seq_len, c, h, w)
-        features = self.encoder(flat_frames)
-        return features.reshape(bsz, seq_len, -1)
-
-    def forward(
-        self,
-        frames: torch.Tensor,
-        mems: Optional[Sequence[Optional[torch.Tensor]]] = None,
-        return_mems: bool = False,
-        return_all_tokens: bool = False,
-        return_gate: bool = False,
-    ):
-        if frames.dim() == 4:
-            frames = frames.unsqueeze(1)
-        if frames.dim() != 5:
-            raise ValueError("Expected input of shape (B, T, C, H, W) or (B, C, H, W).")
-
-        hidden = self._encode_frames(frames)
-        hidden = self.dropout(self.input_norm(hidden))
-
-        num_layers = len(self.layers)
-        if mems is None:
-            mems = [None] * num_layers
-        elif len(mems) != num_layers:
-            raise ValueError(f"Expected {num_layers} memory tensors, received {len(mems)}.")
-
-        mlen = 0
-        if mems and mems[0] is not None:
-            mlen = mems[0].size(1)
-
-        seq_len = hidden.size(1)
-        klen = mlen + seq_len
-        device = hidden.device
-        pos_seq = torch.arange(klen - 1, -1, -1, device=device, dtype=hidden.dtype)
-        pos_emb = self.positional_embedding(pos_seq, hidden.dtype)
-        attn_mask = self._causal_mask(seq_len, mlen, device)
-
-        new_mems: List[Optional[torch.Tensor]] = []
-        output = hidden
-        for layer, mem in zip(self.layers, mems):
-            output, new_mem = layer(output, pos_emb, attn_mask=attn_mask, mem=mem)
-            new_mems.append(new_mem)
-
-        final_hidden = self.final_norm(output)
-        logits_all = self.policy(final_hidden)
-        logits = logits_all if return_all_tokens else logits_all[:, -1]
-        gate_logits = None
-        if return_gate:
-            gate_logits = self.camera_gate_head(final_hidden[:, -1]).squeeze(-1)
-
-        if return_mems:
-            if return_gate:
-                return logits, gate_logits, new_mems
-            return logits, new_mems
-        if return_gate:
-            return logits, gate_logits
-        return logits
-
-
-def parse_policy_config(cfg_dict: dict) -> BasePolicyConfig:
-    """
-    Instantiate the appropriate policy config dataclass from a config dictionary.
-    """
-
-    policy_type = cfg_dict.get("type", "mlp")
-    if policy_type == "vpt_causal":
-        return VPTPolicyConfig(**cfg_dict)
-    if policy_type == "mlp":
-        return PolicyConfig(**cfg_dict)
-    raise ValueError(f"Unsupported policy type '{policy_type}'.")
-
-
-def build_policy(cfg: BasePolicyConfig) -> nn.Module:
-    """
-    Build a policy module from a parsed configuration.
-    """
-
-    if isinstance(cfg, VPTPolicyConfig):
-        return VPTCausalPolicy(cfg)
-    if isinstance(cfg, PolicyConfig):
-        return FoundationBCPolicy(cfg)
-    raise TypeError(f"Unsupported policy configuration type: {type(cfg).__name__}")
+    def forward(self, frames: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
+        """
+        frames: [B, T, C, H, W]  (T can be 1 for single frame)
+        pad_mask: [B, T] with True where PAD (ignored by attention & loss)
+        """
+        B, T, C, H, W = frames.shape
+        x = frames.reshape(B * T, C, H, W)
+        feats = self.encoder(x)              # [B*T, D]
+        feats = feats.view(B, T, -1)         # [B, T, D]
+        # feats = self.temporal(feats, attn_mask=pad_mask)
+        return self.action_head(feats)           # dict of logits [B, T, ·]

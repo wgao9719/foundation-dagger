@@ -3,44 +3,40 @@
 The script ingests MineWorld-style trajectories (paired ``.mp4`` videos and
 ``.jsonl`` action logs) and produces a supervised policy checkpoint compatible
 with the ``foundation_dagger`` module. Each training sample stacks the full
-``N``-frame context window and maximises the joint log-likelihood of the final
-frame's hierarchical action under the VPT policy head, enabling
-Transformer-style policies to leverage temporal attention while still
-supporting single-frame heads. Only a user-specified fraction of the available
-samples is used to keep the bootstrap stage quick.
+``N``-frame context window and predicts the action token sequence associated
+with the final frame, enabling Transformer-style policies to leverage temporal
+attention while still supporting single-frame heads. Only a user-specified
+fraction of the available samples is used to keep the bootstrap stage quick.
 
 Example
 -------
-python -m scripts.train_vpt \
-  --algorithm vpt_bc
-  --dataset mineworld_frames \
-  --experiment mineworld_bc_train \
-  --data-root /workspace/foundation-dagger/foundation-dagger/data/mineworld \
-  --fraction 0.3 \
-  --epochs 20 \
-  --batch-size 32 \
-  --output checkpoints/bc_checkpoints/bc_policy.ckpt
+python scripts/train_initial_bc.py \
+    --dataset mineworld_frames \
+    --data-root /Users/willi1/foundation-dagger/diffusion-forcing-transformer/data/mineworld \
+    --fraction 0.1 \
+    --epochs 10 \
+    --batch-size 32 \
+    --output checkpoints/bc_policy.ckpt \
+    --label-smoothing 0.1
 """
 
 
 from __future__ import annotations
 
 import argparse
-import math
 import random
 import sys
+from copy import deepcopy
 from pathlib import Path
-
-import numpy as np
 
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
-from typing import Any, Dict, List, Optional
-from gym3.types import DictType
+from dataclasses import fields
+from typing import Dict, List, Optional
 
 import torch
-from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 import wandb
@@ -50,20 +46,25 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from datasets.mineworld_data.mineworld_frame_dataset import MineWorldFrameDataset
+from utils.SequentialBatchSampler import PerVideoSequentialBatchSampler
 
 CONFIG_DIR = ROOT_DIR / "configurations"
 
-from algorithms.foundation_dagger.vpt_model.policy import MinecraftAgentPolicy
-from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
-from algorithms.foundation_dagger.vpt_model.load_vpt_config import VPTConfig, parse_policy_config
-from algorithms.foundation_dagger.vpt_model.tree_util import tree_map, tree_multimap
+from algorithms.foundation_dagger.policy import (
+    ActionHeadConfig,
+    PolicyConfig,
+    FoundationBCPolicy,
+)
 
-from utils.SequentialBatchSampler import PerVideoSequentialBatchSampler
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
+
+IGNORE_INDEX = -100
 
 def _load_hydra_configs(
-    dataset_name: str,
-    algorithm_name: str,
-    experiment_name: str,
+    dataset_name: str = "mineworld_frames",
+    algorithm_name: str = "mineworld_bc",
+    experiment_name: str = "mineworld_bc_train"
 ) -> tuple[dict, dict, dict]:
     overrides: list[str] = []
     if dataset_name:
@@ -79,18 +80,39 @@ def _load_hydra_configs(
         cfg = compose(config_name="config", overrides=overrides)
 
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
-    policy_cfg = OmegaConf.to_container(cfg.algorithm, resolve=True)
+    policy_cfg = OmegaConf.to_container(cfg.algorithm.policy, resolve=True)
     exp_cfg = OmegaConf.to_container(cfg.experiment, resolve=True)
     return dataset_cfg, policy_cfg, exp_cfg
 
-def train_vpt_bc(
+def _coerce_policy_config(raw_cfg: Dict, dataset: MineWorldFrameDataset) -> PolicyConfig:
+    cfg = deepcopy(raw_cfg)
+    valid_fields = {field.name for field in fields(PolicyConfig)}
+    filtered_cfg = {key: value for key, value in cfg.items() if key in valid_fields}
+
+    num_button_combos = len(dataset.action_mapper.BUTTONS_COMBINATIONS)
+    num_camera_bins = dataset.action_mapper.n_camera_bins
+    action_cfg = filtered_cfg.get("action")
+    if isinstance(action_cfg, dict):
+        action_cfg.setdefault("buttons_classes", num_button_combos)
+        action_cfg.setdefault("camera_bins", num_camera_bins)
+        filtered_cfg["action"] = ActionHeadConfig(**action_cfg)
+    elif isinstance(action_cfg, ActionHeadConfig):
+        pass
+    else:
+        filtered_cfg["action"] = ActionHeadConfig(
+            buttons_classes=num_button_combos,
+            camera_bins=num_camera_bins,
+            use_camera_gate=True,
+        )
+    return PolicyConfig(**filtered_cfg)
+
+def train_initial_bc(
     data_root: Path,
     fraction: float,
     epochs: int,
     batch_size: int,
     context_frames: int,
     recursive: bool,
-    resize: int,
     output: Path,
     dataset_cfg: Dict,
     policy_cfg_dict: Dict,
@@ -98,9 +120,8 @@ def train_vpt_bc(
     experiment_name: str,
     dataset_name: str,
     exp_cfg: Dict,
+    label_smoothing: Optional[float],
 ) -> None:
-    # get configs
-    policy_cfg: VPTConfig = parse_policy_config(policy_cfg_dict)
 
     #initialize dataset
     dataset = MineWorldFrameDataset(
@@ -109,12 +130,14 @@ def train_vpt_bc(
         recursive=recursive,
         max_open_captures=int(dataset_cfg.get("max_open_captures", 2)),
     )
+    policy_cfg = _coerce_policy_config(policy_cfg_dict, dataset)
     train_cfg = exp_cfg.get("training", {})
     opt_cfg = exp_cfg.get("optimizer", {})
 
-    # get subset length and indices
-    subset_len = max(1, int(len(dataset) * fraction))
-    indices = list(range(len(dataset)))
+    total_samples = len(dataset)
+    if total_samples == 0:
+        raise ValueError(f"No samples found under {data_root}")
+    subset_len = max(1, int(total_samples * fraction))
     random_seed = int(train_cfg.get("seed", dataset_cfg.get("seed", 0)))
     random.seed(random_seed)
 
@@ -123,39 +146,60 @@ def train_vpt_bc(
     for idx, (_, vid, _) in enumerate(dataset.samples):
         video_to_indices.setdefault(int(vid), []).append(idx)
     video_ids = list(video_to_indices.keys())
+    if len(video_ids) < 2:
+        raise ValueError(
+            "Need at least two trajectories to reserve one for validation while keeping the rest for training."
+        )
     random.shuffle(video_ids)
-    indices = []
-    for vid in video_ids:
-        indices.extend(video_to_indices[vid])
 
-    # split dataset into training and validation
-    val_fraction = float(train_cfg.get("val_fraction", dataset_cfg.get("val_fraction", 0.1)))
-    if subset_len <= 1 or val_fraction <= 0:
-        val_fraction = 0.0
-        val_split = 0
-    else:
-        val_split = max(1, int(round(subset_len * val_fraction)))
-        if val_split >= subset_len:
-            val_split = max(1, subset_len - 1)
-    val_indices = indices[:val_split]
-    train_indices = indices[val_split:subset_len]
+    # Reserve exactly one entire trajectory for validation; keep remaining
+    # whole trajectories for training while respecting the fraction budget at
+    # the granularity of complete videos.
+    val_video_id = video_ids[0]
+    train_candidate_videos = video_ids[1:]
+    if not train_candidate_videos:
+        raise ValueError(
+            "Need at least two trajectories to create a train/val split that preserves full videos."
+        )
+
+    val_indices = list(video_to_indices[val_video_id])
+    target_train_samples = max(0, subset_len - len(val_indices))
+    limit_train_subset = fraction < 1.0
+    train_indices: List[int] = []
+    selected_train_videos: List[int] = []
+    for vid in train_candidate_videos:
+        if limit_train_subset and target_train_samples <= 0 and selected_train_videos:
+            break
+        train_indices.extend(video_to_indices[vid])
+        selected_train_videos.append(vid)
+        target_train_samples -= len(video_to_indices[vid])
+    if not train_indices:
+        # Fall back to the first remaining trajectory so training is non-empty.
+        first_vid = train_candidate_videos[0]
+        train_indices = list(video_to_indices[first_vid])
+        selected_train_videos = [first_vid]
+
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
+    effective_total = max(1, len(train_indices) + len(val_indices))
+    val_fraction = len(val_indices) / effective_total
 
     train_video_to_positions: Dict[int, List[int]] = {}
     for subset_idx, dataset_idx in enumerate(train_indices):
         _, vid, _ = dataset.samples[dataset_idx]
         train_video_to_positions.setdefault(int(vid), []).append(subset_idx)
 
-    # load in training hparameters
+
+    # load in training parameters
     train_batch_size = batch_size
     train_epochs = epochs
     train_workers = int(train_cfg.get("num_workers", 4))
     val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
-    checkpoint_interval = int(train_cfg.get("checkpoint_interval", 0))
+    checkpoint_interval = int(train_cfg.get("checkpoint_interval", 1))
+    camera_gate_weight = float(train_cfg.get("camera_gate_weight", 1.0))
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
-    
+
     # initialize wandb
     wandb.init(
         project="foundation-dagger",
@@ -169,12 +213,13 @@ def train_vpt_bc(
             "epochs": train_epochs,
             "batch_size": train_batch_size,
             "context_frames": context_frames,
-            "resize": resize,
             "val_fraction": val_fraction,
             "seed": random_seed,
             "train_samples": len(train_subset),
             "val_samples": len(val_subset),
             "grad_clip_norm": grad_clip_norm if grad_clip_norm is not None else 0.0,
+            "label_smoothing": label_smoothing,
+            "camera_gate_weight": camera_gate_weight,
         },
     )
 
@@ -197,55 +242,19 @@ def train_vpt_bc(
     loader = DataLoader(train_subset, **loader_kwargs)
 
     # initialize model
-    action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
-    action_space = action_mapper.get_action_space_update()
-    action_space = DictType(**action_space)
-
-    model_args = policy_cfg.model.get("args", {})
-    policy_kwargs = model_args.get("net", {}).get("args", {})
-    pi_head_kwargs = model_args.get("pi_head_opts", {})
-
-    model = MinecraftAgentPolicy(action_space, policy_kwargs, pi_head_kwargs)
-
-    # initialize weights
+    model = FoundationBCPolicy(policy_cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # path = "/Users/willi1/foundation-dagger/diffusion-forcing-transformer/checkpoints/vpt/foundation-model-1x.weights"
-    path = "/workspace/foundation-dagger/foundation-dagger/checkpoints/vpt/foundation-model-1x.weights"
-    # model.load_state_dict(torch.load(path, map_location=device), strict=False)
-    state_dict = torch.load(path, map_location=device)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys or unexpected_keys:
-        warn_lines = ["VPT checkpoint load was non-strict:"]
-        if missing_keys:
-            warn_lines.append(f"  missing keys ({len(missing_keys)}): {sorted(missing_keys)[:10]}{' ...' if len(missing_keys) > 10 else ''}")
-        if unexpected_keys:
-            warn_lines.append(f"  unexpected keys ({len(unexpected_keys)}): {sorted(unexpected_keys)[:10]}{' ...' if len(unexpected_keys) > 10 else ''}")
-        print("\n".join(warn_lines))
     model = model.to(device)
+    channel_mean = IMAGENET_MEAN.view(1, 1, 3, 1, 1).to(device)
+    channel_std = IMAGENET_STD.view(1, 1, 3, 1, 1).to(device)
+    camera_null_idx = dataset.action_mapper.camera_null_idx
+    smoothing = float(label_smoothing if label_smoothing is not None else 0.0)
 
-    def _move_state_to_device(state):
-        if state is None:
-            return None
-        if isinstance(state, (list, tuple)):
-            return type(state)(_move_state_to_device(s) for s in state)
-        return state.to(device, non_blocking=True)
-
-    def _stack_states_for_batch(state_list):
-        if not state_list or state_list[0] is None:
-            return None
-        if len(state_list) == 1:
-            return state_list[0]
-        return tree_multimap(lambda *xs: torch.cat(xs, dim=0), state_list[0], *state_list[1:])
-
-    def _slice_state(state, index):
-        if state is None:
-            return None
-        return tree_map(lambda x: x[index : index + 1].detach().clone(), state)
-
-    def _detach_state(state):
-        if state is None:
-            return None
-        return tree_map(lambda x: x.detach(), state)
+    def _prepare_observations(frames: torch.Tensor) -> torch.Tensor:
+        frames = frames.permute(0, 1, 4, 2, 3).contiguous()
+        frames = frames.div(255.0)
+        frames = frames.to(device, non_blocking=True)
+        return (frames - channel_mean) / channel_std
 
     def save_checkpoint(suffix: str | None = None) -> Path:
         if suffix:
@@ -279,141 +288,137 @@ def train_vpt_bc(
     def run_epoch(data_loader, train: bool):
         running_loss = 0.0
         running_examples = 0
-        total_samples = 0
-        correct_exact = 0.0
-        correct_buttons = 0.0
-        correct_camera = 0.0
-        entropy_sum = 0.0
-        entropy_count = 0
-        reset_events = 0
-        overlap_resets = 0
-        stride_sum = 0.0
-        stride_count = 0
-        if train:
-            model.train()
-        else:
-            model.eval()
-
-        iterator = tqdm(data_loader, desc="train" if train else "val", leave=False, ncols=80)
-        episode_hidden_states: Dict[int, Any] = {}
-        last_seen_frame: Dict[int, int] = {}
-
+        running_action_correct = 0
+        running_action_total = 0
+        model.train(mode=train)
+        sample_outputs: list[tuple[dict[str, list[int]], dict[str, list[int]]]] = []
+        iterator = tqdm(data_loader, desc="train" if train else "val", leave=False)
         for batch in iterator:
             observations, _, video_ids, frame_indices = batch
-            observations = observations.to(device, non_blocking=True).contiguous()
+            frames = _prepare_observations(observations)
             video_ids_list = video_ids.cpu().tolist()
             frame_indices_list = frame_indices.cpu().tolist()
             agent_action_list = [
                 dataset.get_agent_action(vid, frame_idx)
                 for vid, frame_idx in zip(video_ids_list, frame_indices_list)
             ]
-            action_keys = agent_action_list[0].keys()
-            agent_actions = {
-                key: torch.stack([action[key] for action in agent_action_list], dim=0).to(device, non_blocking=True)
-                for key in action_keys
-            }
-            batch_size = observations.size(0)
-            seq_len = observations.size(1) if observations.dim() >= 2 else 1
+            buttons_targets = (
+                torch.stack([action["buttons"] for action in agent_action_list], dim=0)
+                .to(device, non_blocking=True)
+                .squeeze(-1)
+                .long()
+            )
+            camera_targets = (
+                torch.stack([action["camera"] for action in agent_action_list], dim=0)
+                .to(device, non_blocking=True)
+                .squeeze(-1)
+                .long()
+            )
+            camera_gate_targets = (camera_targets != camera_null_idx).long()
+
             with torch.set_grad_enabled(train):
-                state_inputs = []
-                first = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
-                for idx, (vid, frame_idx) in enumerate(zip(video_ids_list, frame_indices_list)):
-                    stored_state = episode_hidden_states.get(vid)
-                    last_frame = last_seen_frame.get(vid)
-                    needs_reset = stored_state is None or last_frame is None or frame_idx <= last_frame
-                    reset_due_to_overlap = last_frame is not None and frame_idx <= last_frame
-                    if needs_reset:
-                        stored_state = _move_state_to_device(model.initial_state(1))
-                        reset_events += 1
-                        if reset_due_to_overlap:
-                            overlap_resets += 1
-                    elif last_frame is not None:
-                        stride_sum += frame_idx - last_frame
-                        stride_count += 1
-                    if stored_state is not None:
-                        episode_hidden_states[vid] = stored_state
-                    state_inputs.append(stored_state)
-                    if needs_reset:
-                        first[idx, 0] = True
-                state_in = _stack_states_for_batch(state_inputs)
-                obs_dict = {"img": observations}
-                policy_tuple, state_out = model(obs_dict, first, state_in)
-                pd_params = policy_tuple[0]
-                final_pd_params = tree_map(lambda x: x[:, -1], pd_params)
-                log_prob = model.pi_head.logprob(agent_actions, final_pd_params)
-                pred_buttons = torch.argmax(final_pd_params["buttons"], dim=-1)
-                pred_camera = torch.argmax(final_pd_params["camera"], dim=-1)
-                target_buttons = agent_actions["buttons"]
-                target_camera = agent_actions["camera"]
-                buttons_match = pred_buttons.eq(target_buttons).all(dim=-1)
-                camera_match = pred_camera.eq(target_camera).all(dim=-1)
-                exact_match = buttons_match & camera_match
-                correct_buttons += buttons_match.float().sum().item()
-                correct_camera += camera_match.float().sum().item()
-                correct_exact += exact_match.float().sum().item()
-                entropy_values = model.pi_head.entropy(final_pd_params)
-                entropy_per_sample = entropy_values.reshape(entropy_values.shape[0], -1).mean(dim=1)
-                entropy_sum += entropy_per_sample.detach().sum().item()
-                entropy_count += entropy_per_sample.numel()
-                loss = -log_prob.mean()
+                logits = model(frames)
+                last_logits = {key: value[:, -1] for key, value in logits.items()}
+                buttons_loss = F.cross_entropy(last_logits["buttons"], buttons_targets, label_smoothing=smoothing)
+                camera_loss = F.cross_entropy(last_logits["camera"], camera_targets, label_smoothing=smoothing)
+                loss = buttons_loss + camera_loss
+                if "camera_gate" in last_logits:
+                    gate_loss = F.cross_entropy(
+                        last_logits["camera_gate"], camera_gate_targets, label_smoothing=smoothing
+                    )
+                    loss = loss + camera_gate_weight * gate_loss
                 if train:
                     optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     optimizer.step()
-                if state_out is not None:
-                    detached_state = _detach_state(state_out)
-                    for idx, vid in enumerate(video_ids_list):
-                        episode_hidden_states[vid] = _slice_state(detached_state, idx)
-                for vid, frame_idx in zip(video_ids_list, frame_indices_list):
-                    last_seen_frame[vid] = frame_idx
-            total_samples += batch_size
-            running_loss += (-log_prob.detach()).sum().item()
-            running_examples += log_prob.numel()
-            if running_examples > 0:
-                iterator.set_postfix(
-                    loss=f"{running_loss / running_examples:.4f}",
-                )
-        metrics = {}
-        if total_samples > 0:
-            metrics["accuracy"] = correct_exact / total_samples
-            metrics["accuracy_buttons"] = correct_buttons / total_samples
-            metrics["accuracy_camera"] = correct_camera / total_samples
-            metrics["reset_fraction"] = reset_events / total_samples
-            metrics["overlap_reset_fraction"] = overlap_resets / total_samples
-        if stride_count > 0:
-            metrics["avg_stride"] = stride_sum / stride_count
-        if entropy_count > 0:
-            metrics["entropy"] = entropy_sum / entropy_count
+
+            batch_size = frames.size(0)
+            running_loss += loss.detach().item() * batch_size
+            running_examples += batch_size
+
+            preds: dict[str, torch.Tensor] = {
+                "buttons": last_logits["buttons"].argmax(dim=-1),
+                "camera": last_logits["camera"].argmax(dim=-1),
+            }
+            targets: dict[str, torch.Tensor] = {
+                "buttons": buttons_targets,
+                "camera": camera_targets,
+            }
+            if "camera_gate" in last_logits:
+                preds["camera_gate"] = last_logits["camera_gate"].argmax(dim=-1)
+                targets["camera_gate"] = camera_gate_targets
+
+            for key, target_tensor in targets.items():
+                pred_tensor = preds.get(key)
+                if pred_tensor is None:
+                    continue
+                matches = pred_tensor == target_tensor
+                running_action_correct += matches.sum().item()
+                running_action_total += target_tensor.numel()
+
+            if len(sample_outputs) < 3:
+                take = min(batch_size, 3 - len(sample_outputs))
+                for sample_idx in range(take):
+                    target_snapshot = {
+                        key: [int(targets[key][sample_idx].detach().cpu())]
+                        for key in targets
+                        if key in preds
+                    }
+                    pred_snapshot = {
+                        key: [int(preds[key][sample_idx].detach().cpu())] for key in target_snapshot
+                    }
+                    sample_outputs.append((target_snapshot, pred_snapshot))
+                    if len(sample_outputs) >= 3:
+                        break
+
         if running_examples == 0:
-            return 0.0, metrics
-        return running_loss / running_examples, metrics
+            return 0.0, None, sample_outputs
+        action_acc = None
+        if running_action_total > 0:
+            action_acc = running_action_correct / running_action_total
+        return running_loss / running_examples, action_acc, sample_outputs
 
     for epoch in range(train_epochs):
-        train_batch_sampler.set_epoch(epoch)
-        train_loss, train_stats = run_epoch(loader, train=True)
-        if len(val_subset) > 0:
-            val_loss, val_stats = run_epoch(val_loader, train=False)
-        else:
-            val_loss, val_stats = None, {}
+        train_loss, train_acc, train_samples = run_epoch(loader, train=True)
+        val_loss, val_acc, val_samples = run_epoch(val_loader, train=False)
+
         metrics = {
             "train/loss": train_loss,
         }
-        for key, value in train_stats.items():
-            metrics[f"train/{key}"] = value
+        if train_acc is not None:
+            metrics["train/acc"] = train_acc
         if val_loss is not None:
             metrics["val/loss"] = val_loss
-            for key, value in val_stats.items():
-                metrics[f"val/{key}"] = value
+            if val_acc is not None:
+                metrics["val/acc"] = val_acc
         wandb.log(metrics, step=epoch + 1)
+        train_acc_str = f"{train_acc:.4f}" if train_acc is not None else "n/a"
+        val_acc_str = f"{val_acc:.4f}" if val_acc is not None else "n/a"
         if val_loss is not None:
             print(
-                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} "
-                f"- val_loss: {val_loss:.4f}"
+                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc_str} "
+                f"- val_loss: {val_loss:.4f} - val_acc: {val_acc_str} "
             )
+            if train_samples:
+                print("Training samples (target vs. prediction):")
+                for idx, (target_tokens, pred_tokens) in enumerate(train_samples, start=1):
+                    print(f"  Sample {idx}:")
+                    for key in sorted(target_tokens.keys()):
+                        target_vals = target_tokens[key]
+                        pred_vals = pred_tokens.get(key, [])
+                        print(f"    {key}: target={target_vals} pred={pred_vals}")
+            if val_samples:
+                print("Validation samples (target vs. prediction):")
+                for idx, (target_tokens, pred_tokens) in enumerate(val_samples, start=1):
+                    print(f"  Sample {idx}:")
+                    for key in sorted(target_tokens.keys()):
+                        target_vals = target_tokens[key]
+                        pred_vals = pred_tokens.get(key, [])
+                        print(f"    {key}: target={target_vals} pred={pred_vals}")
         else:
             print(
-                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f}"
+                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc_str} "
             )
         if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
             ckpt_path = save_checkpoint(f"epoch{epoch + 1:03d}")
@@ -429,7 +434,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--algorithm",
         type=str,
-        default="vpt_bc",
+        default="mineworld_bc",
         help="Hydra algorithm config name.",
     )
     parser.add_argument(
@@ -475,12 +480,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of frames in the conditioning window. Overrides config if provided.",
     )
     parser.add_argument(
-        "--resize",
-        type=int,
-        default=None,
-        help="Spatial size to resize frames to. Overrides config if provided.",
-    )
-    parser.add_argument(
         "--no-recursive",
         action="store_true",
         help="Disable recursive search for videos under the data root.",
@@ -491,16 +490,21 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs") / "bootstrap_bc.ckpt",
         help="Path to save the trained checkpoint.",
     )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.1,
+        help="Label smoothing coefficient for BC loss (overrides config).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    
     dataset_cfg, policy_cfg_dict, exp_cfg = _load_hydra_configs(
-        dataset_name=args.dataset, algorithm_name=args.algorithm, experiment_name=args.experiment
+        dataset_name=args.dataset, algorithm_name='mineworld_bc', experiment_name='mineworld_bc_train'
     )
-    algorithm_name = args.algorithm or policy_cfg_dict.get("name", "vpt_bc")
+    algorithm_name = args.algorithm or policy_cfg_dict.get("name", "mineworld_bc")
     dataset_name = args.dataset or dataset_cfg.get("name", "mineworld_frames")
     experiment_name = args.experiment or exp_cfg.get("name", "mineworld_bc_train")
 
@@ -531,11 +535,6 @@ if __name__ == "__main__":
     else:
         context_frames = int(dataset_cfg.get("context_frames", 8))
 
-    if args.resize is not None:
-        resize = args.resize
-    else:
-        resize = int(dataset_cfg.get("resize", dataset_cfg.get("resolution", 256)))
-
     if args.output is not None:
         output = args.output
     else:
@@ -545,14 +544,13 @@ if __name__ == "__main__":
     if args.no_recursive:
         recursive = False
 
-    train_vpt_bc(
+    train_initial_bc(
         data_root=data_root,
         fraction=fraction,
         epochs=epochs,
         batch_size=batch_size,
         context_frames=context_frames,
         recursive=recursive,
-        resize=resize,
         output=output,
         dataset_cfg=dataset_cfg,
         policy_cfg_dict=policy_cfg_dict,
@@ -560,4 +558,5 @@ if __name__ == "__main__":
         experiment_name=experiment_name,
         dataset_name=dataset_name,
         exp_cfg=exp_cfg,
+        label_smoothing=args.label_smoothing,
     )

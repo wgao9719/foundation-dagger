@@ -3,7 +3,7 @@ defaults:
   - _self_
   - experiment: mineworld_bc_train # experiment yaml file name in configurations/experiments folder [fixme]
   - dataset: mineworld_frames # dataset yaml file name in configurations/dataset folder [fixme]
-  - algorithm: vpt_bc # algorithm yaml file name in configurations/algorithm folder [fixme]
+  - algorithm: vpt_bc_1x # algorithm yaml file name in configurations/algorithm folder [fixme]
   - optional dataset_experiment: ${dataset}_${experiment} # optional yaml file in configurations/dataset_experiment folder, overrides algorithm and experiment configurations that are dataset and experiment dependent
   - cluster: null # optional, cluster yaml file name in configurations/cluster folder. Leave null for local compute
 

@@ -1,0 +1,250 @@
+version: 3741
+model:
+  args:
+    net:
+      args:
+        active_reward_monitors:
+          craft_stats:
+            args:
+              collapse_var: true
+              items:
+                - planks
+                - stick
+                - crafting_table
+                - wooden_pickaxe
+                - stone_pickaxe
+                - furnace
+                - iron_ingot
+                - iron_pickaxe
+                - diamond_pickaxe
+                - torch
+            weight: 0
+          mine_stats:
+            args:
+              collapse_var: true
+              items:
+                - log
+                - coal_ore
+                - stone
+                - iron_ore
+                - diamond_ore
+                - obsidian
+            weight: 0
+          order_invariant_curriculum:
+            args:
+              curriculum:
+                coal:
+                  - 5
+                  - 0.4
+                cobblestone:
+                  - 11
+                  - 0.09090909090909091
+                crafting_table:
+                  - 1
+                  - 1
+                diamond:
+                  - 10000
+                  - 2.6666666666666665
+                diamond_pickaxe:
+                  - 10000
+                  - 8
+                furnace:
+                  - 1
+                  - 1
+                iron_ingot:
+                  - 3
+                  - 1.3333333333333333
+                iron_ore:
+                  - 3
+                  - 1.3333333333333333
+                iron_pickaxe:
+                  - 1
+                  - 4
+                log:
+                  - 8
+                  - 0.125
+                obsidian:
+                  - 10000
+                  - 16
+                planks:
+                  - 20
+                  - 0.05
+                stick:
+                  - 16
+                  - 0.0625
+                stone_pickaxe:
+                  - 1
+                  - 1
+                torch:
+                  - 16
+                  - 0.125
+                wooden_pickaxe:
+                  - 1
+                  - 1
+            weight: 1
+          pickup_stats:
+            args:
+              collapse_var: true
+              items:
+                - log
+                - coal
+                - cobblestone
+                - iron_ore
+                - diamond
+            weight: 0
+          variety:
+            args:
+              collapse_var: true
+              included_items:
+                - beef
+                - chicken
+                - leather
+                - mutton
+                - porkchop
+                - bucket
+                - milk_bucket
+                - water_bucket
+                - coal
+                - crafting_table
+                - furnace
+                - diamond
+                - gold_ingot
+                - gold_ore
+                - flint
+                - iron_ingot
+                - iron_ore
+                - shears
+                - string
+                - cobblestone
+                - log
+                - planks
+                - stick
+                - wool
+                - obsidian
+                - paper
+                - redstone
+                - wheat
+                - cooked_beef
+                - cooked_chicken
+                - cooked_mutton
+                - cooked_porkchop
+                - egg
+                - feather
+                - leather_boots
+                - leather_chestplate
+                - leather_helmet
+                - leather_leggings
+                - brick
+                - brick_stairs
+                - clay
+                - clay_ball
+                - flower_pot
+                - terracotta
+                - torch
+                - diamond_axe
+                - diamond_block
+                - diamond_boots
+                - diamond_chestplate
+                - diamond_helmet
+                - diamond_hoe
+                - diamond_leggings
+                - diamond_pickaxe
+                - diamond_shovel
+                - diamond_sword
+                - dirt
+                - golden_apple
+                - golden_axe
+                - golden_boots
+                - golden_chestplate
+                - golden_helmet
+                - golden_hoe
+                - golden_leggings
+                - golden_pickaxe
+                - golden_shovel
+                - golden_sword
+                - arrow
+                - gravel
+                - iron_axe
+                - iron_boots
+                - iron_chestplate
+                - iron_helmet
+                - iron_hoe
+                - iron_leggings
+                - iron_pickaxe
+                - iron_shovel
+                - iron_sword
+                - shield
+                - fermented_spider_eye
+                - leaves
+                - apple
+                - bread
+                - activator_rail
+                - clock
+                - compass
+                - detector_rail
+                - dropper
+                - book
+                - bookshelf
+                - cake
+                - filled_map
+                - sugar_cane
+                - sugar
+                - bow
+                - dispenser
+                - fishing_rod
+                - spider_eye
+                - stone_axe
+                - stone_hoe
+                - stone_pickaxe
+                - stone_shovel
+                - stone_sword
+                - boat
+                - wooden_axe
+                - wooden_hoe
+                - wooden_pickaxe
+                - wooden_shovel
+                - wooden_sword
+                - banner
+                - bed
+                - carpet
+                - map
+                - redstone_torch
+                - wheat_seeds
+                - flint_and_steel
+            weight: 0
+        attention_heads: 16
+        attention_mask_style: clipped_causal
+        attention_memory_size: 256
+        diff_mlp_embedding: false
+        hidsize: 2048
+        img_shape:
+          - 128
+          - 128
+          - 3
+        impala_chans:
+          - 16
+          - 32
+          - 32
+        impala_kwargs:
+          post_pool_groups: 1
+        impala_width: 8
+        init_norm_kwargs:
+          batch_norm: false
+          group_norm_groups: 1
+        n_recurrence_layers: 4
+        only_img_input: true
+        pointwise_ratio: 4
+        pointwise_use_activation: false
+        recurrence_is_residual: true
+        recurrence_type: transformer
+        timesteps: 128
+        use_pointwise_layer: true
+        use_pre_lstm_ln: false
+      function: ypt.model.policy:MinecraftPolicy
+      local_args: {}
+    pi_head_opts:
+      temperature: 2
+  function: forc.model.rl.ppg.ppg_policy:create
+extra_args:
+  ac_space: "<DictType: Dict(buttons=D8641[1], camera=D121[1])>"
+  ob_space: "<DictType: Dict(air=D23[], chest=D976[], diff_goal=D65[42], feet=D976[], food=D23[], head=D976[], img=D256[128,128,3], inventory=D2305[976], legs=D976[], life=D23[], mainhand_item=D976[], mask=Dict(craft=D2[977], equip=D2[977], place=D2[977]), offhand_item=D976[], saturation=D23[], xp=D23[])>"

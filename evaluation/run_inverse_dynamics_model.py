@@ -32,8 +32,8 @@ KEYBOARD_BUTTON_MAPPING = {
     "key.keyboard.space" :"jump",
     "key.keyboard.a" :"left",
     "key.keyboard.d" :"right",
-    "key.keyboard.left.shift" :"sneak",
-    "key.keyboard.left.control" :"sprint",
+    "key.keyboard.left.shift" :"sprint",
+    "key.keyboard.left.control" :"sneak",
     "key.keyboard.f" :"swapHands",
 }
 

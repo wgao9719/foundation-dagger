@@ -178,11 +178,17 @@ def train_vpt_bc(
     val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
     checkpoint_interval = int(train_cfg.get("checkpoint_interval", 1))
-    camera_gate_weight = float(train_cfg.get("camera_gate_weight", 1.0))
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
-    train_label_smoothing = train_cfg.get("label_smoothing", 0.1)
-
+    postfix_print_interval = int(train_cfg.get("postfix_print_interval", 200))
+    
     # initialize wandb
+    train_label_smoothing = train_cfg.get("label_smoothing", label_smoothing)
+    if train_label_smoothing is None:
+        train_label_smoothing = 0.0
+    train_label_smoothing = float(train_label_smoothing)
+    if not 0.0 <= train_label_smoothing < 1.0:
+        raise ValueError("label_smoothing must be in [0, 1).")
+
     wandb.init(
         project="foundation-dagger",
         job_type="bc-bootstrap",
@@ -202,7 +208,7 @@ def train_vpt_bc(
             "val_samples": len(val_subset),
             "grad_clip_norm": grad_clip_norm if grad_clip_norm is not None else 0.0,
             "label_smoothing": train_label_smoothing,
-            "camera_gate_weight": camera_gate_weight,
+            "postfix_print_interval": postfix_print_interval,
         },
     )
 
@@ -322,6 +328,32 @@ def train_vpt_bc(
             bonus = bonus + reshaped.mean(dim=-1).sum(dim=-1)
         return bonus
 
+    def _compute_f1(tp: torch.Tensor, fp: torch.Tensor, fn: torch.Tensor) -> torch.Tensor:
+        eps = 1e-8
+        precision = tp / (tp + fp + eps)
+        recall = tp / (tp + fn + eps)
+        return 2 * precision * recall / (precision + recall + eps)
+
+    def _format_postfix(
+        avg_loss: float,
+        kl_mean: float,
+        acc_exact: float,
+        acc_buttons: float,
+        acc_camera: float,
+        button_f1: torch.Tensor,
+        camera_f1: torch.Tensor,
+    ) -> str:
+        button_parts = [f"{name.replace('.', '_')}:{button_f1[idx].item():.2f}" for idx, name in enumerate(Buttons.ALL)]
+        cam_x_parts = [f"{bin_idx}:{camera_f1[0, bin_idx].item():.2f}" for bin_idx in range(camera_f1.shape[1])]
+        cam_y_parts = [f"{bin_idx}:{camera_f1[1, bin_idx].item():.2f}" for bin_idx in range(camera_f1.shape[1])]
+        lines = [
+            f"loss={avg_loss:.4f} kl_mean={kl_mean:.4f} acc={acc_exact:.3f} acc_buttons={acc_buttons:.3f} acc_camera={acc_camera:.3f}",
+            "buttons " + " ".join(button_parts),
+            "camera_x " + " ".join(cam_x_parts),
+            "camera_y " + " ".join(cam_y_parts),
+        ]
+        return "\n".join(lines)
+
     def run_epoch(data_loader, train: bool):
         running_loss = 0.0
         running_examples = 0
@@ -357,8 +389,10 @@ def train_vpt_bc(
         iterator = tqdm(data_loader, desc="train" if train else "val", leave=False)
         episode_hidden_states: Dict[int, Any] = {}
         last_seen_frame: Dict[int, int] = {}
+        latest_button_f1: Optional[torch.Tensor] = None
+        latest_camera_f1: Optional[torch.Tensor] = None
 
-        for batch in iterator:
+        for batch_idx, batch in enumerate(iterator):
             observations, _, video_ids, frame_indices = batch
             observations = observations.to(device, non_blocking=True).contiguous()
             video_ids_list = video_ids.cpu().tolist()
@@ -495,17 +529,35 @@ def train_vpt_bc(
             running_examples += log_prob.numel()
             if running_examples > 0:
                 kl_mean = running_kl / running_examples
-                kl_var = max(running_kl_sq / running_examples - kl_mean ** 2, 0.0)
-                iterator.set_postfix(
-                    loss=f"{running_loss / running_examples:.4f}",
-                    kl_divergence_mean=f"{kl_mean:.4f}",
-                    kl_divergence_sum=f"{running_kl:.4f}",
-                    kl_divergence_std=f"{math.sqrt(kl_var):.4f}",
-                    accuracy=f"{correct_exact / total_samples:.4f}",
-                    accuracy_buttons=f"{correct_buttons / total_samples:.4f}",
-                    accuracy_camera=f"{correct_camera / total_samples:.4f}",
-                    reset_fraction=f"{reset_events / total_samples:.4f}",
+                latest_button_f1 = _compute_f1(button_tp, button_fp, button_fn)
+                latest_camera_f1 = _compute_f1(camera_tp, camera_fp, camera_fn)
+                if postfix_print_interval > 0 and batch_idx % postfix_print_interval == 0:
+                    tqdm.write(
+                        _format_postfix(
+                            running_loss / running_examples,
+                            kl_mean,
+                            correct_exact / total_samples,
+                            correct_buttons / total_samples,
+                            correct_camera / total_samples,
+                            latest_button_f1,
+                            latest_camera_f1,
+                        )
+                    )
+        if running_examples > 0 and postfix_print_interval > 0:
+            final_button_f1 = latest_button_f1 or _compute_f1(button_tp, button_fp, button_fn)
+            final_camera_f1 = latest_camera_f1 or _compute_f1(camera_tp, camera_fp, camera_fn)
+            tqdm.write(
+                _format_postfix(
+                    running_loss / running_examples,
+                    running_kl / running_examples,
+                    correct_exact / max(total_samples, 1),
+                    correct_buttons / max(total_samples, 1),
+                    correct_camera / max(total_samples, 1),
+                    final_button_f1,
+                    final_camera_f1,
                 )
+            )
+
         metrics = {}
         if total_samples > 0:
             metrics["accuracy"] = correct_exact / total_samples
@@ -521,20 +573,19 @@ def train_vpt_bc(
         if entropy_count > 0:
             metrics["entropy"] = entropy_sum / entropy_count
         if running_examples > 0:
+            if latest_button_f1 is None:
+                latest_button_f1 = _compute_f1(button_tp, button_fp, button_fn)
+            if latest_camera_f1 is None:
+                latest_camera_f1 = _compute_f1(camera_tp, camera_fp, camera_fn)
             kl_mean = running_kl / running_examples
             metrics["kl_divergence_mean"] = kl_mean
             metrics["kl_divergence_sum"] = running_kl
             kl_var = max(running_kl_sq / running_examples - kl_mean ** 2, 0.0)
             metrics["kl_divergence_std"] = math.sqrt(kl_var)
-            eps = 1e-8
-            button_precision = button_tp / (button_tp + button_fp + eps)
-            button_recall = button_tp / (button_tp + button_fn + eps)
-            button_f1 = 2 * button_precision * button_recall / (button_precision + button_recall + eps)
+            button_f1 = latest_button_f1
             for idx, name in enumerate(Buttons.ALL):
                 metrics[f"f1/button_{name.replace('.', '_')}"] = button_f1[idx].item()
-            camera_precision = camera_tp / (camera_tp + camera_fp + eps)
-            camera_recall = camera_tp / (camera_tp + camera_fn + eps)
-            camera_f1 = 2 * camera_precision * camera_recall / (camera_precision + camera_recall + eps)
+            camera_f1 = latest_camera_f1
             for axis_idx, axis_name in enumerate(("x", "y")):
                 axis_macro = camera_f1[axis_idx].mean().item()
                 metrics[f"f1/camera_{axis_name}_macro"] = axis_macro

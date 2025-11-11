@@ -1,0 +1,43 @@
+policy:
+  type: resnet_temporal_factorized   # formerly vpt_causal
+
+  # ---- vision backbone ----
+  backbone: resnet50
+  pretrained_backbone: true
+  backbone_trainable: true
+  backbone_dim: null                # null → use encoder’s native dim
+
+  # ---- temporal encoder (causal Transformer) ----
+  # temporal_layers: 2
+  # temporal_heads: 4
+  # temporal_dropout: 0.0
+  # attention_mask: causal            # causal self-attn over T
+  # mem_len: 0                        # 0 = no TXL-style memory (use >0 only if you add TXL)
+
+  # ---- head/trunk MLP (shared) ----
+  hidden_dim: 512
+  head_layers: 2
+  dropout: 0.0
+  activation: gelu
+
+  # ---- VPT-style factorized action head ----
+  action:
+    # Use your dataset’s combo mapping; replace placeholder below:
+    buttons_classes: ${dataset.buttons_combo_count}   # e.g., 80
+    buttons_multilabel: false                         # set true only if using per-button bits+BCE
+    camera_bins: 11
+    use_camera_gate: true
+
+  # ---- loss knobs (for training code to read) ----
+  loss:
+    label_smoothing: 0.05        # for CE heads (buttons/cam_x/cam_y)
+    gate_weight: 0.5             # weight for camera gate CE
+    # (optional) class weights/focal for buttons if long-tail:
+    # buttons_focal_gamma: 1.0
+    # buttons_class_weights: ${dataset.buttons_class_weights}
+
+  # ---- optional auxiliary joint token head (start disabled) ----
+  joint_head:
+    enabled: false
+    vocab_size: ${dataset.joint_vocab_size}  # only if you precompute joint tokens
+    loss_weight: 0.3
