@@ -13,6 +13,7 @@ training:
   camera_gate_weight: 0.45
   esc_loss_weight: 1.0  # may cause issues with train_vpt (not integrated there)
   grad_clip_norm: 0.5
+  prefetch_factor: 4
 
 # optimizer:
 #   lr: 1e-8

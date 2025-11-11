@@ -404,6 +404,12 @@ def train_initial_bc(
                     if len(sample_outputs) >= 3:
                         break
 
+            if running_examples > 0:
+                postfix = {"loss": f"{running_loss / running_examples:.3f}"}
+                if running_action_total > 0:
+                    postfix["acc"] = f"{running_action_correct / running_action_total:.3f}"
+                iterator.set_postfix(postfix)
+
         if running_examples == 0:
             return 0.0, None, sample_outputs
         action_acc = None
