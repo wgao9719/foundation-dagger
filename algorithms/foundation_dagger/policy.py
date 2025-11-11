@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
+
+from gym3.types import DictType
+
+from algorithms.foundation_dagger.vpt_model.action_head import make_action_head
+from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
 
 
 def _camel_case(name: str) -> str:
@@ -79,11 +85,18 @@ class TemporalEncoder(nn.Module):
 
 @dataclass
 class ActionHeadConfig:
-    # buttons: either categorical over combos OR multi-label bits
-    buttons_classes: int                     # e.g., num combo ids (recommended)
-    camera_bins: int = 11                    # per-axis bins (e.g., 11)
-    use_camera_gate: bool = True             # predict "camera active?" bit
-    buttons_multilabel: bool = False         # set True if you want BCE per button bit
+    """
+    Configuration shim so Hydra configs that referenced the legacy head still load.
+
+    Only ``camera_bins`` and ``temperature`` are consulted by the current VPT-style head;
+    the remaining fields are kept for backwards compatibility with older configs.
+    """
+
+    buttons_classes: int                     # legacy no-op
+    camera_bins: int = 11                    # discretization bins for the mapper
+    use_camera_gate: bool = True             # retained for compatibility (unused)
+    buttons_multilabel: bool = False         # retained for compatibility (unused)
+    temperature: float = 1.0                 # softmax temperature passed to the VPT head
 
 def _default_action_head_cfg() -> "ActionHeadConfig":
     # Import lazily to avoid adding a hard dependency on gym3 during lightweight usage.
@@ -95,63 +108,6 @@ def _default_action_head_cfg() -> "ActionHeadConfig":
     except Exception:
         pass
     return ActionHeadConfig(buttons_classes=buttons_classes, camera_bins=11, use_camera_gate=True)
-
-def _get_activation(name: Literal["gelu", "relu"]) -> Callable[[], nn.Module]:
-    lowered = name.lower()
-    if lowered == "gelu":
-        return nn.GELU
-    if lowered == "relu":
-        return lambda: nn.ReLU(inplace=True)
-    raise ValueError(f"Unsupported activation '{name}'")
-
-
-class ActionHead(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        cfg: ActionHeadConfig,
-        layers: int = 2,
-        dropout: float = 0.0,
-        activation: Literal["gelu", "relu"] = "gelu",
-    ):
-        super().__init__()
-        act_factory = _get_activation(activation)
-        # shared MLP trunk
-        trunk = []
-        d = input_dim
-        for _ in range(layers - 1):
-            trunk += [nn.Linear(d, hidden_dim), act_factory()]
-            if dropout > 0:
-                trunk += [nn.Dropout(dropout)]
-            d = hidden_dim
-        self.trunk = nn.Sequential(*trunk) if trunk else nn.Identity()
-
-        # heads
-        self.buttons = nn.Linear(d or input_dim, cfg.buttons_classes if not cfg.buttons_multilabel else cfg.buttons_classes)
-        self.cam_x   = nn.Linear(d or input_dim, cfg.camera_bins)
-        self.cam_y   = nn.Linear(d or input_dim, cfg.camera_bins)
-        self.gate    = nn.Linear(d or input_dim, 2) if cfg.use_camera_gate else None
-        self.cfg     = cfg
-
-    def forward(self, h: torch.Tensor) -> dict[str, torch.Tensor]:
-        # h: [B, T, D]
-        z = self.trunk(h)
-        buttons_logits = self.buttons(z)
-        cam_x_logits = self.cam_x(z)
-        cam_y_logits = self.cam_y(z)
-        camera_joint = (
-            cam_x_logits.unsqueeze(-1) + cam_y_logits.unsqueeze(-2)
-        ).reshape(z.shape[0], z.shape[1], -1)
-        out = {
-            "buttons": buttons_logits,    # [B, T, C] (or bits)
-            "camera_x": cam_x_logits,     # [B, T, n_bins]
-            "camera_y": cam_y_logits,     # [B, T, n_bins]
-            "camera": camera_joint,       # [B, T, n_bins^2]
-        }
-        if self.cfg.use_camera_gate:
-            out["camera_gate"] = self.gate(z)    # [B, T, 2]
-        return out
 
 
 @dataclass
@@ -192,14 +148,15 @@ class FoundationBCPolicy(nn.Module):
         #     n_heads=cfg.temporal_heads,
         #     seq_dropout=cfg.temporal_dropout,
         # )
-        self.action_head = ActionHead(
-            input_dim=feat_dim,
-            hidden_dim=cfg.hidden_dim,
-            cfg=cfg.action,
-            layers=cfg.head_layers,
-            dropout=cfg.dropout,
-            activation=cfg.activation,
+        mapper_bins = cfg.action.camera_bins
+        self.action_mapper = CameraHierarchicalMapping(n_camera_bins=mapper_bins)
+        action_space = DictType(**self.action_mapper.get_action_space_update())
+        self.action_head = make_action_head(
+            action_space,
+            feat_dim,
+            temperature=getattr(cfg.action, "temperature", 1.0),
         )
+        self.esc_head = nn.Linear(feat_dim, 2)
 
     def forward(self, frames: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
         """
@@ -211,4 +168,6 @@ class FoundationBCPolicy(nn.Module):
         feats = self.encoder(x)              # [B*T, D]
         feats = feats.view(B, T, -1)         # [B, T, D]
         # feats = self.temporal(feats, attn_mask=pad_mask)
-        return self.action_head(feats)           # dict of logits [B, T, ·]
+        logits = self.action_head(feats)     # action-space dict of log-probs
+        logits["esc"] = F.log_softmax(self.esc_head(feats), dim=-1)
+        return logits

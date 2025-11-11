@@ -61,9 +61,28 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
 
 IGNORE_INDEX = -100
 
+def _logprob_cross_entropy(log_probs: torch.Tensor, targets: torch.Tensor, smoothing: float = 0.0) -> torch.Tensor:
+    """
+    Cross-entropy between log-probabilities and integer targets with optional label smoothing.
+    """
+    if smoothing and smoothing > 0.0:
+        n_classes = log_probs.size(-1)
+        confidence = 1.0 - smoothing
+        smooth = smoothing / max(n_classes - 1, 1)
+        true_dist = torch.full_like(log_probs, smooth)
+        true_dist.scatter_(-1, targets.unsqueeze(-1), confidence)
+        loss = (-true_dist * log_probs).sum(dim=-1)
+        return loss.mean()
+    return F.nll_loss(log_probs, targets, reduction="mean")
+
+def _squeeze_action_dim(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dim() >= 2 and tensor.shape[-2] == 1:
+        return tensor.squeeze(-2)
+    return tensor
+
 def _load_hydra_configs(
     dataset_name: str = "mineworld_frames",
-    algorithm_name: str = "mineworld_bc",
+    algorithm_name: str = "policy_bc",
     experiment_name: str = "mineworld_bc_train"
 ) -> tuple[dict, dict, dict]:
     overrides: list[str] = []
@@ -199,6 +218,7 @@ def train_initial_bc(
     checkpoint_interval = int(train_cfg.get("checkpoint_interval", 1))
     camera_gate_weight = float(train_cfg.get("camera_gate_weight", 1.0))
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
+    esc_loss_weight = float(train_cfg.get("esc_loss_weight", 1.0))
 
     # initialize wandb
     wandb.init(
@@ -220,6 +240,7 @@ def train_initial_bc(
             "grad_clip_norm": grad_clip_norm if grad_clip_norm is not None else 0.0,
             "label_smoothing": label_smoothing,
             "camera_gate_weight": camera_gate_weight,
+            "esc_loss_weight": esc_loss_weight,
         },
     )
 
@@ -302,6 +323,11 @@ def train_initial_bc(
                 dataset.get_agent_action(vid, frame_idx)
                 for vid, frame_idx in zip(video_ids_list, frame_indices_list)
             ]
+            esc_targets = torch.tensor(
+                [dataset.get_esc_flag(vid, frame_idx) for vid, frame_idx in zip(video_ids_list, frame_indices_list)],
+                dtype=torch.long,
+                device=device,
+            )
             buttons_targets = (
                 torch.stack([action["buttons"] for action in agent_action_list], dim=0)
                 .to(device, non_blocking=True)
@@ -318,15 +344,18 @@ def train_initial_bc(
 
             with torch.set_grad_enabled(train):
                 logits = model(frames)
-                last_logits = {key: value[:, -1] for key, value in logits.items()}
-                buttons_loss = F.cross_entropy(last_logits["buttons"], buttons_targets, label_smoothing=smoothing)
-                camera_loss = F.cross_entropy(last_logits["camera"], camera_targets, label_smoothing=smoothing)
+                last_logits = {key: _squeeze_action_dim(value[:, -1]) for key, value in logits.items()}
+                buttons_loss = _logprob_cross_entropy(last_logits["buttons"], buttons_targets, smoothing)
+                camera_loss = _logprob_cross_entropy(last_logits["camera"], camera_targets, smoothing)
                 loss = buttons_loss + camera_loss
                 if "camera_gate" in last_logits:
                     gate_loss = F.cross_entropy(
                         last_logits["camera_gate"], camera_gate_targets, label_smoothing=smoothing
                     )
                     loss = loss + camera_gate_weight * gate_loss
+                if "esc" in last_logits:
+                    esc_loss = _logprob_cross_entropy(last_logits["esc"], esc_targets, smoothing)
+                    loss = loss + esc_loss_weight * esc_loss
                 if train:
                     optimizer.zero_grad()
                     loss.backward()
@@ -345,6 +374,9 @@ def train_initial_bc(
                 "buttons": buttons_targets,
                 "camera": camera_targets,
             }
+            if "esc" in last_logits:
+                preds["esc"] = last_logits["esc"].argmax(dim=-1)
+                targets["esc"] = esc_targets
             if "camera_gate" in last_logits:
                 preds["camera_gate"] = last_logits["camera_gate"].argmax(dim=-1)
                 targets["camera_gate"] = camera_gate_targets
@@ -434,7 +466,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--algorithm",
         type=str,
-        default="mineworld_bc",
+        default="policy_bc",
         help="Hydra algorithm config name.",
     )
     parser.add_argument(
@@ -502,9 +534,9 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     dataset_cfg, policy_cfg_dict, exp_cfg = _load_hydra_configs(
-        dataset_name=args.dataset, algorithm_name='mineworld_bc', experiment_name='mineworld_bc_train'
+        dataset_name=args.dataset, algorithm_name='policy_bc', experiment_name='mineworld_bc_train'
     )
-    algorithm_name = args.algorithm or policy_cfg_dict.get("name", "mineworld_bc")
+    algorithm_name = args.algorithm or policy_cfg_dict.get("name", "policy_bc")
     dataset_name = args.dataset or dataset_cfg.get("name", "mineworld_frames")
     experiment_name = args.experiment or exp_cfg.get("name", "mineworld_bc_train")
 

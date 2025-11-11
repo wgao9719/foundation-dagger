@@ -22,16 +22,16 @@ policy:
 
   # ---- VPT-style factorized action head ----
   action:
-    # Use your dataset’s combo mapping; replace placeholder below:
-    buttons_classes: ${dataset.buttons_combo_count}   # e.g., 80
-    buttons_multilabel: false                         # set true only if using per-button bits+BCE
-    camera_bins: 11
-    use_camera_gate: true
+    buttons_classes: 80          # legacy shim (value unused)
+    camera_bins: 11              # must match dataset/action mapper bins
+    temperature: 1.0             # softmax temperature fed into VPT head
+    use_camera_gate: false       # retained for legacy compatibility (ignored)
 
   # ---- loss knobs (for training code to read) ----
   loss:
     label_smoothing: 0.05        # for CE heads (buttons/cam_x/cam_y)
     gate_weight: 0.5             # weight for camera gate CE
+    esc_weight: 1.0              # weight for ESC classifier CE
     # (optional) class weights/focal for buttons if long-tail:
     # buttons_focal_gamma: 1.0
     # buttons_class_weights: ${dataset.buttons_class_weights}
@@ -39,5 +39,5 @@ policy:
   # ---- optional auxiliary joint token head (start disabled) ----
   joint_head:
     enabled: false
-    vocab_size: ${dataset.joint_vocab_size}  # only if you precompute joint tokens
+    vocab_size: null              # set explicitly if you enable joint token supervision
     loss_weight: 0.3
