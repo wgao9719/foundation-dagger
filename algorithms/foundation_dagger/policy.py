@@ -101,12 +101,10 @@ class ActionHeadConfig:
 def _default_action_head_cfg() -> "ActionHeadConfig":
     # Import lazily to avoid adding a hard dependency on gym3 during lightweight usage.
     buttons_classes = 80
-    try:
-        from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
 
-        buttons_classes = len(CameraHierarchicalMapping.BUTTONS_COMBINATIONS)
-    except Exception:
-        pass
+    from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
+    buttons_classes = len(CameraHierarchicalMapping.BUTTONS_COMBINATIONS)
+
     return ActionHeadConfig(buttons_classes=buttons_classes, camera_bins=11, use_camera_gate=True)
 
 

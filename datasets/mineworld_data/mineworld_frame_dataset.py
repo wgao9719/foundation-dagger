@@ -268,11 +268,11 @@ class MineWorldFrameDataset(Dataset):
         frames_tensor = torch.stack(frame_tensors, dim=0)
 
         final_step = step_infos[end_idx]
-        action_indices = self.mc_dataset.get_action_index_from_actiondict(
-            final_step["action"],
-            action_vocab_offset=0,
-        )
-        label = torch.tensor(action_indices, dtype=torch.long)
+        # Construct a compact, tensor-friendly label from the already-discretized agent action
+        agent_action = self.agent_actions[(int(video_id), int(final_step["frame_idx"]))]
+        buttons_idx = int(agent_action["buttons"][0])
+        camera_idx = int(agent_action["camera"][0])
+        label = torch.tensor([buttons_idx, camera_idx], dtype=torch.long)
         return (
             frames_tensor,
             label,

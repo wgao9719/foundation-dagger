@@ -4,16 +4,15 @@ defaults:
 training:
   batch_size: 32
   epochs: 20
-  val_fraction: 0.01
+  val_fraction: 0.001
   seed: 0
   checkpoint_interval: 1
-  num_workers: 64
+  num_workers: 96
   val_num_workers: 4
   #camera_gate_weight: 1.0
   camera_gate_weight: 0.45
-  esc_loss_weight: 1.0  # may cause issues with train_vpt (not integrated there)
+  esc_loss_weight: 0.8  # may cause issues with train_vpt (not integrated there)
   grad_clip_norm: 0.5
-  prefetch_factor: 4
 
 # optimizer:
 #   lr: 1e-8

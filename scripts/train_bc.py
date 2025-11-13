@@ -147,7 +147,7 @@ def train_initial_bc(
         data_root=data_root,
         context_frames=context_frames,
         recursive=recursive,
-        max_open_captures=int(dataset_cfg.get("max_open_captures", 2)),
+        max_open_captures=int(dataset_cfg.get("max_open_captures", 2))
     )
     policy_cfg = _coerce_policy_config(policy_cfg_dict, dataset)
     train_cfg = exp_cfg.get("training", {})
