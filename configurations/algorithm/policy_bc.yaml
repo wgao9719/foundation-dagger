@@ -32,6 +32,7 @@ policy:
     label_smoothing: 0.05        # for CE heads (buttons/cam_x/cam_y)
     gate_weight: 0.5             # weight for camera gate CE
     esc_weight: 1.0              # weight for ESC classifier CE
+    entropy_weight: 0.01         # buttons/camera entropy bonus
     # (optional) class weights/focal for buttons if long-tail:
     # buttons_focal_gamma: 1.0
     # buttons_class_weights: ${dataset.buttons_class_weights}

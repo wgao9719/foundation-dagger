@@ -34,12 +34,14 @@ from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
 from dataclasses import fields
 from typing import Dict, List, Optional
+from collections import Counter
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 import wandb
+import numpy as np
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -61,7 +63,12 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
 
 IGNORE_INDEX = -100
 
-def _logprob_cross_entropy(log_probs: torch.Tensor, targets: torch.Tensor, smoothing: float = 0.0) -> torch.Tensor:
+def _logprob_cross_entropy(
+    log_probs: torch.Tensor,
+    targets: torch.Tensor,
+    smoothing: float = 0.0,
+    weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Cross-entropy between log-probabilities and integer targets with optional label smoothing.
     """
@@ -72,13 +79,59 @@ def _logprob_cross_entropy(log_probs: torch.Tensor, targets: torch.Tensor, smoot
         true_dist = torch.full_like(log_probs, smooth)
         true_dist.scatter_(-1, targets.unsqueeze(-1), confidence)
         loss = (-true_dist * log_probs).sum(dim=-1)
+        if weights is not None:
+            loss = loss * weights.gather(0, targets.view(-1)).view_as(loss)
         return loss.mean()
-    return F.nll_loss(log_probs, targets, reduction="mean")
+    nll = F.nll_loss(log_probs, targets, reduction="none")
+    if weights is not None:
+        nll = nll * weights.gather(0, targets.view(-1)).view_as(nll)
+    return nll.mean()
 
 def _squeeze_action_dim(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.dim() >= 2 and tensor.shape[-2] == 1:
         return tensor.squeeze(-2)
     return tensor
+
+def _entropy_from_logprobs(log_probs: torch.Tensor) -> torch.Tensor:
+    probs = log_probs.exp()
+    entropy = -(probs * log_probs).sum(dim=-1)
+    return entropy.mean()
+
+def _estimate_button_class_weights(
+    dataset: MineWorldFrameDataset,
+    video_to_indices: Dict[int, List[int]],
+    max_videos: int = 3,
+) -> torch.Tensor:
+    num_classes = len(dataset.action_mapper.BUTTONS_COMBINATIONS)
+    weights = torch.ones(num_classes, dtype=torch.float32)
+    if not video_to_indices:
+        return weights
+    selected_videos = sorted(video_to_indices.keys())[:max(1, max_videos)]
+    counts: Counter[int] = Counter()
+    for vid in selected_videos:
+        indices = video_to_indices.get(int(vid), [])
+        for dataset_idx in indices:
+            _, sample_vid, end_idx = dataset.samples[dataset_idx]
+            sample_vid = int(sample_vid)
+            end_idx = int(end_idx)
+            step_infos = dataset.video_step_infos.get(sample_vid)
+            if step_infos is None or end_idx >= len(step_infos):
+                continue
+            frame_idx = int(step_infos[end_idx]["frame_idx"])
+            agent_action = dataset.agent_actions.get((sample_vid, frame_idx))
+            if not agent_action:
+                continue
+            buttons_value = agent_action.get("buttons")
+            if buttons_value is None:
+                continue
+            button_idx = int(np.asarray(buttons_value).reshape(-1)[0])
+            counts[button_idx] += 1
+    if not counts:
+        return weights
+    mean_count = sum(counts.values()) / len(counts)
+    for cls, freq in counts.items():
+        weights[cls] = float(mean_count / max(freq, 1))
+    return weights
 
 def _load_hydra_configs(
     dataset_name: str = "mineworld_frames",
@@ -161,9 +214,15 @@ def train_initial_bc(
     random.seed(random_seed)
 
     # Shuffle at the video level while preserving chronological ordering per video.
+    weight_estimation_videos = 3
     video_to_indices: Dict[int, List[int]] = {}
     for idx, (_, vid, _) in enumerate(dataset.samples):
         video_to_indices.setdefault(int(vid), []).append(idx)
+    button_weight_tensor = _estimate_button_class_weights(
+        dataset,
+        video_to_indices,
+        max_videos=weight_estimation_videos,
+    )
     video_ids = list(video_to_indices.keys())
     if len(video_ids) < 2:
         raise ValueError(
@@ -217,6 +276,7 @@ def train_initial_bc(
     val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
     checkpoint_interval = int(train_cfg.get("checkpoint_interval", 1))
     camera_gate_weight = float(train_cfg.get("camera_gate_weight", 1.0))
+    entropy_weight = float(train_cfg.get("entropy_weight", 0.0))
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
     esc_loss_weight = float(train_cfg.get("esc_loss_weight", 1.0))
 
@@ -241,6 +301,8 @@ def train_initial_bc(
             "label_smoothing": label_smoothing,
             "camera_gate_weight": camera_gate_weight,
             "esc_loss_weight": esc_loss_weight,
+            "entropy_weight": entropy_weight,
+            "button_weight_videos": weight_estimation_videos,
         },
     )
 
@@ -264,8 +326,11 @@ def train_initial_bc(
 
     # initialize model
     model = FoundationBCPolicy(policy_cfg)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
+
     model = model.to(device)
+    button_class_weights = button_weight_tensor.to(device)
     channel_mean = IMAGENET_MEAN.view(1, 1, 3, 1, 1).to(device)
     channel_std = IMAGENET_STD.view(1, 1, 3, 1, 1).to(device)
     camera_null_idx = dataset.action_mapper.camera_null_idx
@@ -345,9 +410,15 @@ def train_initial_bc(
             with torch.set_grad_enabled(train):
                 logits = model(frames)
                 last_logits = {key: _squeeze_action_dim(value[:, -1]) for key, value in logits.items()}
-                buttons_loss = _logprob_cross_entropy(last_logits["buttons"], buttons_targets, smoothing)
+                buttons_loss = _logprob_cross_entropy(
+                    last_logits["buttons"],
+                    buttons_targets,
+                    smoothing,
+                    weights=button_class_weights,
+                )
                 camera_loss = _logprob_cross_entropy(last_logits["camera"], camera_targets, smoothing)
-                loss = buttons_loss + camera_loss
+                entropy_term = _entropy_from_logprobs(last_logits["buttons"]) + _entropy_from_logprobs(last_logits["camera"])
+                loss = buttons_loss + camera_loss - entropy_weight * entropy_term
                 if "camera_gate" in last_logits:
                     gate_loss = F.cross_entropy(
                         last_logits["camera_gate"], camera_gate_targets, label_smoothing=smoothing
