@@ -167,5 +167,5 @@ class FoundationBCPolicy(nn.Module):
         feats = feats.view(B, T, -1)         # [B, T, D]
         # feats = self.temporal(feats, attn_mask=pad_mask)
         logits = self.action_head(feats)     # action-space dict of log-probs
-        logits["esc"] = F.log_softmax(self.esc_head(feats), dim=-1)
+        logits["esc"] = self.esc_head(feats)
         return logits

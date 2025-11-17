@@ -101,6 +101,7 @@ def _estimate_button_class_weights(
     dataset: MineWorldFrameDataset,
     video_to_indices: Dict[int, List[int]],
     max_videos: int = 3,
+    weight_temperature: float = 1.0,
 ) -> torch.Tensor:
     num_classes = len(dataset.action_mapper.BUTTONS_COMBINATIONS)
     weights = torch.ones(num_classes, dtype=torch.float32)
@@ -130,7 +131,8 @@ def _estimate_button_class_weights(
         return weights
     mean_count = sum(counts.values()) / len(counts)
     for cls, freq in counts.items():
-        weights[cls] = float(mean_count / max(freq, 1))
+        scaled = float(mean_count / max(freq, 1))
+        weights[cls] = scaled ** weight_temperature
     return weights
 
 def _load_hydra_configs(
@@ -218,11 +220,14 @@ def train_initial_bc(
     video_to_indices: Dict[int, List[int]] = {}
     for idx, (_, vid, _) in enumerate(dataset.samples):
         video_to_indices.setdefault(int(vid), []).append(idx)
+    weight_temperature = float(train_cfg.get("button_weight_temperature", 0.5))
     button_weight_tensor = _estimate_button_class_weights(
         dataset,
         video_to_indices,
         max_videos=weight_estimation_videos,
+        weight_temperature=weight_temperature,
     )
+    print(f"Button weight tensor: {button_weight_tensor}")
     video_ids = list(video_to_indices.keys())
     if len(video_ids) < 2:
         raise ValueError(
@@ -303,6 +308,7 @@ def train_initial_bc(
             "esc_loss_weight": esc_loss_weight,
             "entropy_weight": entropy_weight,
             "button_weight_videos": weight_estimation_videos,
+            "button_weight_temperature": weight_temperature,
         },
     )
 
