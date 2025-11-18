@@ -15,7 +15,7 @@ from datasets.video import MinecraftAdvancedVideoDataset
 from .dagger_module import FoundationDaggerModule
 from .planner import CEMPlanner, MPCConfig
 from .vlm import VisionLanguageScorer
-from .world_model import DFoTWorldModel, WorldModelConfig
+from algorithms.mineworld.model import MineWorldModel
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "configurations"
@@ -191,7 +191,7 @@ class FoundationDaggerCollector:
             device=world_model_cfg.get("device", "cuda"),
             context_frames=world_model_cfg.get("context_frames", 8),
         )
-        self.world_model = DFoTWorldModel(wm_cfg)
+        self.world_model = MineWorldModel(wm_cfg)
 
         if isinstance(vlm_cfg, str):
             vlm_cfg = OmegaConf.load(vlm_cfg)
