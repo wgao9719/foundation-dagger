@@ -1,7 +1,7 @@
 """
 python -m algorithms.mineworld.mineworld_testing \
-    --checkpoint /Users/willi1/foundation-dagger/diffusion-forcing-transformer/checkpoints/700M_16f.ckpt \
-    --output outputs/mineworld/test_video.mp4
+    --checkpoint "/checkpoints/700M_16f.ckpt" \
+    --output "outputs/mineworld/test_video.mp4"
 """
 
 

@@ -137,6 +137,27 @@ class EpisodeVideoRecorder:
             self._writer = None
 
 
+def _make_forward_warmup_action(action_space: gym.spaces.Dict) -> Dict[str, Any]:
+    """Construct a simple MineRL action dict that walks forward while sprinting."""
+    action: Dict[str, Any] = {}
+    for key, space in action_space.spaces.items():
+        if isinstance(space, gym.spaces.Discrete):
+            action[key] = int(0)
+        elif isinstance(space, gym.spaces.Box):
+            zeros = np.zeros(space.shape, dtype=space.dtype if getattr(space, "dtype", None) is not None else np.float32)
+            action[key] = zeros
+        else:
+            action[key] = space.sample() * 0
+    for key in ("forward", "sprint"):
+        if key in action:
+            action[key] = int(1)
+    if "jump" in action:
+        action["jump"] = int(1)
+    if "camera" in action:
+        action["camera"] = np.zeros_like(action["camera"])
+    return action
+
+
 class BCPolicyAgent:
     def __init__(
         self,
@@ -244,6 +265,8 @@ def evaluate_policy(args: argparse.Namespace) -> None:
         context_frames=context_frames,
     )
 
+    warmup_action = _make_forward_warmup_action(env.action_space) if args.warmup_steps > 0 else None
+
     for episode_idx in range(args.episodes):
         obs, _ = _reset_env(env, seed=(args.seed + episode_idx) if args.seed is not None else None)
         agent.reset()
@@ -254,6 +277,14 @@ def evaluate_policy(args: argparse.Namespace) -> None:
         video_path = run_dir / f"episode_{episode_idx:03d}.mp4"
         recorder = EpisodeVideoRecorder(video_path, fps=args.video_fps)
         recorder.append(_extract_frame(obs))
+
+        if warmup_action is not None:
+            for _ in range(args.warmup_steps):
+                obs, _, done, _ = _step_env(env, warmup_action)
+                recorder.append(_extract_frame(obs))
+                if done:
+                    break
+            agent.reset()
 
         try:
             while not done and (args.max_steps is None or steps < args.max_steps):
@@ -288,6 +319,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, choices=["cpu", "cuda"], default=None, help="Computation device override.")
     parser.add_argument("--seed", type=int, default=None, help="Base random seed for environment resets.")
     parser.add_argument("--render", action="store_true", help="Render the MineRL environment locally during evaluation.")
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=12,
+        help="Number of scripted forward steps to take after reset before handing control to the BC policy.",
+    )
     return parser.parse_args()
 
 

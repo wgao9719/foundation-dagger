@@ -313,15 +313,23 @@ def train_initial_bc(
     )
 
     # initialize data loader
+    # prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
+    # train_batch_sampler = PerVideoSequentialBatchSampler(
+    #     video_to_positions=train_video_to_positions,
+    #     batch_size=train_batch_size,s
+    #     seed=random_seed,
+    # )
     prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
-    train_batch_sampler = PerVideoSequentialBatchSampler(
-        video_to_positions=train_video_to_positions,
-        batch_size=train_batch_size,
-        seed=random_seed,
-    )
 
+    # loader_kwargs = dict(
+    #     batch_sampler=train_batch_sampler,
+    #     num_workers=train_workers,
+    #     pin_memory=True,
+    #     persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
+    # )
     loader_kwargs = dict(
-        batch_sampler=train_batch_sampler,
+        batch_size=train_batch_size,
+        shuffle=True,
         num_workers=train_workers,
         pin_memory=True,
         persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
@@ -332,8 +340,8 @@ def train_initial_bc(
 
     # initialize model
     model = FoundationBCPolicy(policy_cfg)
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
 
     model = model.to(device)
     button_class_weights = button_weight_tensor.to(device)
@@ -382,6 +390,10 @@ def train_initial_bc(
         running_examples = 0
         running_action_correct = 0
         running_action_total = 0
+        running_buttons_loss = 0.0
+        running_camera_loss = 0.0
+        running_esc_loss = 0.0
+        esc_present_any = False
         model.train(mode=train)
         sample_outputs: list[tuple[dict[str, list[int]], dict[str, list[int]]]] = []
         iterator = tqdm(data_loader, desc="train" if train else "val", leave=False)
@@ -442,6 +454,11 @@ def train_initial_bc(
             batch_size = frames.size(0)
             running_loss += loss.detach().item() * batch_size
             running_examples += batch_size
+            running_buttons_loss += buttons_loss.detach().item() * batch_size
+            running_camera_loss += camera_loss.detach().item() * batch_size
+            if "esc" in last_logits:
+                running_esc_loss += esc_loss.detach().item() * batch_size
+                esc_present_any = True
 
             preds: dict[str, torch.Tensor] = {
                 "buttons": last_logits["buttons"].argmax(dim=-1),
@@ -485,26 +502,50 @@ def train_initial_bc(
                 postfix = {"loss": f"{running_loss / running_examples:.3f}"}
                 if running_action_total > 0:
                     postfix["acc"] = f"{running_action_correct / running_action_total:.3f}"
+                postfix["loss_buttons"] = f"{buttons_loss.detach().item():.3f}"
+                postfix["loss_camera"] = f"{camera_loss.detach().item():.3f}"
+                if "esc" in last_logits:
+                    postfix["loss_esc"] = f"{esc_loss.detach().item():.3f}"
                 iterator.set_postfix(postfix)
 
         if running_examples == 0:
-            return 0.0, None, sample_outputs
+            return 0.0, None, sample_outputs, {"buttons": None, "camera": None, "esc": None}
         action_acc = None
         if running_action_total > 0:
             action_acc = running_action_correct / running_action_total
-        return running_loss / running_examples, action_acc, sample_outputs
+        avg_buttons_loss = running_buttons_loss / running_examples
+        avg_camera_loss = running_camera_loss / running_examples
+        avg_esc_loss = running_esc_loss / running_examples if esc_present_any else None
+        return (
+            running_loss / running_examples,
+            action_acc,
+            sample_outputs,
+            {"buttons": avg_buttons_loss, "camera": avg_camera_loss, "esc": avg_esc_loss},
+        )
 
     for epoch in range(train_epochs):
-        train_loss, train_acc, train_samples = run_epoch(loader, train=True)
-        val_loss, val_acc, val_samples = run_epoch(val_loader, train=False)
+        train_loss, train_acc, train_samples, train_comp = run_epoch(loader, train=True)
+        val_loss, val_acc, val_samples, val_comp = run_epoch(val_loader, train=False)
 
         metrics = {
             "train/loss": train_loss,
         }
+        if train_comp.get("buttons") is not None:
+            metrics["train/loss_buttons"] = train_comp["buttons"]
+        if train_comp.get("camera") is not None:
+            metrics["train/loss_camera"] = train_comp["camera"]
+        if train_comp.get("esc") is not None:
+            metrics["train/loss_esc"] = train_comp["esc"]
         if train_acc is not None:
             metrics["train/acc"] = train_acc
         if val_loss is not None:
             metrics["val/loss"] = val_loss
+            if val_comp.get("buttons") is not None:
+                metrics["val/loss_buttons"] = val_comp["buttons"]
+            if val_comp.get("camera") is not None:
+                metrics["val/loss_camera"] = val_comp["camera"]
+            if val_comp.get("esc") is not None:
+                metrics["val/loss_esc"] = val_comp["esc"]
             if val_acc is not None:
                 metrics["val/acc"] = val_acc
         wandb.log(metrics, step=epoch + 1)
