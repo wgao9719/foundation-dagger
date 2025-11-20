@@ -202,7 +202,7 @@ def train_initial_bc(
         data_root=data_root,
         context_frames=context_frames,
         recursive=recursive,
-        max_open_captures=int(dataset_cfg.get("max_open_captures", 2))
+        max_open_captures=int(dataset_cfg.get("max_open_captures", 5))
     )
     policy_cfg = _coerce_policy_config(policy_cfg_dict, dataset)
     train_cfg = exp_cfg.get("training", {})
@@ -332,7 +332,7 @@ def train_initial_bc(
         shuffle=True,
         num_workers=train_workers,
         pin_memory=True,
-        persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
+    persistent_workers=True,  # Disabled to avoid stale VideoCapture objects across epochs
     )
     if train_workers > 0:
         loader_kwargs["prefetch_factor"] = max(prefetch_factor, 1)

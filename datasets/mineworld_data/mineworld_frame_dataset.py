@@ -80,7 +80,7 @@ class MineWorldFrameDataset(Dataset):
         cursor_alpha = cursor_image[:, :, 3:] / 255.0
         cursor_rgb = cursor_image[:, :, :3]
         return cursor_rgb, cursor_alpha
-
+        
     def _build_index(self, recursive: bool) -> None:
         pattern = "**/*.mp4" if recursive else "*.mp4"
         video_paths = sorted(self.data_root.glob(pattern))

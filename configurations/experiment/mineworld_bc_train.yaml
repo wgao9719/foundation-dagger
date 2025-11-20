@@ -7,7 +7,7 @@ training:
   val_fraction: 0.001
   seed: 0
   checkpoint_interval: 1
-  num_workers: 96
+  num_workers: 48
   #num_workers: 10
   val_num_workers: 4
   #val_num_workers: 2
