@@ -27,6 +27,7 @@ import argparse
 import random
 import sys
 from copy import deepcopy
+import math
 from pathlib import Path
 
 from hydra import compose, initialize_config_dir
@@ -90,7 +91,7 @@ def _logprob_cross_entropy(
     return nll.mean()
 
 def _squeeze_action_dim(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.dim() >= 2 and tensor.shape[-2] == 1:
+    if tensor.dim() >= 3 and tensor.shape[-2] == 1:
         return tensor.squeeze(-2)
     return tensor
 
@@ -308,6 +309,10 @@ def train_initial_bc(
     entropy_weight = float(train_cfg.get("entropy_weight", 0.0))
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
     esc_loss_weight = float(train_cfg.get("esc_loss_weight", 1.0))
+    scheduler_cfg = train_cfg.get("scheduler", {})
+    scheduler_name = scheduler_cfg.get("name")
+    warmup_steps = int(scheduler_cfg.get("warmup_steps", 0))
+    min_lr = float(scheduler_cfg.get("min_lr", 0.0))
 
     # initialize wandb
     wandb.init(
@@ -396,13 +401,29 @@ def train_initial_bc(
         betas=tuple(opt_cfg.get("betas", [0.9, 0.99])),
         weight_decay=float(opt_cfg.get("weight_decay", 1e-4)),
     )
+    scheduler = None
+    total_train_steps = len(loader) * train_epochs
+    if scheduler_name == "cosine":
+        base_lr = optimizer.param_groups[0]["lr"]
+        min_ratio = min_lr / base_lr if base_lr > 0 else 0.0
+
+        def _cosine_lambda(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return float(step + 1) / float(warmup_steps)
+            if total_train_steps <= warmup_steps:
+                return 1.0
+            progress = min(1.0, (step - warmup_steps) / max(1, total_train_steps - warmup_steps))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_cosine_lambda)
 
     val_prefetch_factor = int(train_cfg.get("val_prefetch_factor", prefetch_factor))
     val_loader_kwargs = dict(
         batch_size=val_batch_size,
         num_workers=val_workers,
         pin_memory=True,
-        shuffle=False,
+        shuffle=True,
         persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
     )
     if val_workers > 0:
@@ -422,31 +443,14 @@ def train_initial_bc(
         sample_outputs: list[tuple[dict[str, list[int]], dict[str, list[int]]]] = []
         iterator = tqdm(data_loader, desc="train" if train else "val", leave=False)
         for batch in iterator:
-            observations, _, video_ids, frame_indices = batch
+            observations, labels, video_ids, frame_indices = batch
             frames = _prepare_observations(observations)
-            video_ids_list = video_ids.cpu().tolist()
-            frame_indices_list = frame_indices.cpu().tolist()
-            agent_action_list = [
-                dataset.get_agent_action(vid, frame_idx)
-                for vid, frame_idx in zip(video_ids_list, frame_indices_list)
-            ]
-            esc_targets = torch.tensor(
-                [dataset.get_esc_flag(vid, frame_idx) for vid, frame_idx in zip(video_ids_list, frame_indices_list)],
-                dtype=torch.long,
-                device=device,
-            )
-            buttons_targets = (
-                torch.stack([action["buttons"] for action in agent_action_list], dim=0)
-                .to(device, non_blocking=True)
-                .squeeze(-1)
-                .long()
-            )
-            camera_targets = (
-                torch.stack([action["camera"] for action in agent_action_list], dim=0)
-                .to(device, non_blocking=True)
-                .squeeze(-1)
-                .long()
-            )
+            
+            labels = labels.to(device, non_blocking=True)
+            buttons_targets = labels[:, 0]
+            camera_targets = labels[:, 1]
+            esc_targets = labels[:, 2]
+
             camera_gate_targets = (camera_targets != camera_null_idx).long()
 
             with torch.set_grad_enabled(train):
@@ -474,6 +478,8 @@ def train_initial_bc(
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
 
             batch_size = frames.size(0)
             running_loss += loss.detach().item() * batch_size
@@ -507,8 +513,8 @@ def train_initial_bc(
                 running_action_correct += matches.sum().item()
                 running_action_total += target_tensor.numel()
 
-            if len(sample_outputs) < 3:
-                take = min(batch_size, 3 - len(sample_outputs))
+            if len(sample_outputs) < 5:
+                take = min(batch_size, 5 - len(sample_outputs))
                 for sample_idx in range(take):
                     target_snapshot = {
                         key: [int(targets[key][sample_idx].detach().cpu())]
