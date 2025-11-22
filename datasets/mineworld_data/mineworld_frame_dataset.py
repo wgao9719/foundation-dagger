@@ -10,16 +10,28 @@ import torch
 from torch.utils.data import Dataset
 
 from datasets.mineworld_data.mcdataset import MCDataset
-from datasets.mineworld_data.parsing import process_video_actions
 from evaluation.agent import ACTION_TRANSFORMER_KWARGS, AGENT_RESOLUTION, resize_image
 from evaluation.data_loader import (
     CURSOR_FILE,
     MINEREC_ORIGINAL_HEIGHT_PX,
     composite_images_with_alpha,
 )
+from evaluation.run_inverse_dynamics_model import json_action_to_env_action
 from algorithms.foundation_dagger.vpt_model.action_mapping import CameraHierarchicalMapping
 from algorithms.foundation_dagger.vpt_model.actions import ActionTransformer, Buttons
 
+
+def _load_actions(json_path: Path) -> List[Dict]:
+    if not json_path.exists():
+        raise FileNotFoundError(f"Missing action log for {json_path}")
+    actions: List[Dict] = []
+    with json_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            actions.append(json.loads(line))
+    return actions
 
 class MineWorldFrameDataset(Dataset):
     """
@@ -32,7 +44,6 @@ class MineWorldFrameDataset(Dataset):
         context_frames: int = 8,
         recursive: bool = True,
         max_open_captures: int = 12,
-        max_cached_actions: int = 32,
     ) -> None:
         # Disable OpenCV's own threading to avoid exhausting ffmpeg worker pools
         try:
@@ -42,7 +53,8 @@ class MineWorldFrameDataset(Dataset):
         self.data_root = Path(data_root)
         self.context_frames = context_frames
         self.samples: list[tuple[Path, int, int]] = []
-        
+        self.actions_cache: dict[Path, list[dict]] = {}
+        self.video_step_infos: dict[int, list[Dict[str, object]]] = {}
         self.mc_dataset = MCDataset()
         self.mc_dataset.make_action_vocab(action_vocab_offset=0)
         self.action_vocab = self.mc_dataset.action_vocab
@@ -50,22 +62,14 @@ class MineWorldFrameDataset(Dataset):
         self.action_length = self.mc_dataset.action_length
         self.action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
         self.action_transformer = ActionTransformer(**ACTION_TRANSFORMER_KWARGS)
-
-        # LRU Cache for action data
-        self._action_cache: dict[int, dict] = {}
-        self._action_cache_order: list[int] = []
-        self._max_cached_actions = max(1, int(max_cached_actions))
-
+        self.agent_actions: dict[tuple[int, int], Dict[str, np.ndarray]] = {}
+        self.esc_actions: dict[tuple[int, int], int] = {}
         self._capture_cache: dict[Path, cv2.VideoCapture] = {}
         self._last_frame_index: dict[Path, int] = {}
         self._video_ids: dict[Path, int] = {}
-        self._video_paths: dict[int, Path] = {}  # Reverse mapping
-        
         self._window_cache: dict[int, tuple[int, torch.Tensor]] = {}
         self._cursor_image_rgb, self._cursor_alpha = self._load_cursor()
-        
         self._build_index(recursive=recursive)
-        
         self._max_open_captures = max(1, int(max_open_captures))
         self._capture_order: list[Path] = []
 
@@ -89,83 +93,80 @@ class MineWorldFrameDataset(Dataset):
 
         for video_path in video_paths:
             action_path = video_path.with_suffix(".jsonl")
-            if not action_path.exists():
-                continue
-            
-            step_infos, agent_actions_list, esc_flags_list, _ = process_video_actions(
-                video_path, action_path, self.context_frames, check_video_frame_count=True
-            )
-
-            if not step_infos:
+            try:
+                actions = self.actions_cache.setdefault(
+                    action_path, _load_actions(action_path)
+                )
+            except FileNotFoundError:
                 continue
 
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                cap.release()
+                continue
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+
+            usable = min(frame_count, len(actions))
             video_id = self._video_ids.setdefault(video_path, len(self._video_ids))
-            self._video_paths[video_id] = video_path
+            video_steps = self.video_step_infos.setdefault(video_id, [])
 
-            # We do NOT store step_infos, agent_actions, etc. globally anymore to save memory.
-            # We only use them here to identify valid samples.
-            for end_idx in range(self.context_frames - 1, len(step_infos)):
-                self.samples.append((video_path, video_id, end_idx))
-            
-            # Optionally pre-populate cache for the last few videos if desired, 
-            # but we rely on on-demand loading.
-            # If we want to cache it now:
-            self._cache_video_data(video_id, step_infos, agent_actions_list, esc_flags_list)
+            attack_is_stuck = False
+            last_hotbar = 0
+
+            for step_idx in range(usable):
+                base_step = actions[step_idx]
+
+                if step_idx == 0:
+                    if base_step.get("mouse", {}).get("newButtons", []) == [0]:
+                        attack_is_stuck = True
+                elif attack_is_stuck:
+                    if 0 in base_step.get("mouse", {}).get("newButtons", []):
+                        attack_is_stuck = False
+
+                step_data = dict(base_step)
+                mouse_data = dict(step_data.get("mouse", {}))
+                if attack_is_stuck:
+                    mouse_data["buttons"] = [b for b in mouse_data.get("buttons", []) if b != 0]
+                step_data["mouse"] = mouse_data
+
+                action_dict, is_null_action = json_action_to_env_action(step_data)
+
+                current_hotbar = step_data.get("hotbar", last_hotbar)
+                if current_hotbar != last_hotbar:
+                    action_dict[f"hotbar.{current_hotbar + 1}"] = 1
+                last_hotbar = current_hotbar
+
+                if is_null_action:
+                    continue
+
+                normalized_action: Dict[str, np.ndarray | int] = {
+                    key: value.copy() if isinstance(value, np.ndarray) else int(value)
+                    for key, value in action_dict.items()
+                }
+                agent_action_np = self._env_action_to_agent_np(normalized_action)
+                self.agent_actions[(video_id, step_idx)] = agent_action_np
+                self.esc_actions[(video_id, step_idx)] = int(normalized_action.get("ESC", 0))
+
+                video_steps.append(
+                    dict(
+                        frame_idx=step_idx,
+                        action=normalized_action,
+                        is_gui_open=bool(step_data.get("isGuiOpen", False)),
+                        cursor_x=float(mouse_data.get("x", 0.0)),
+                        cursor_y=float(mouse_data.get("y", 0.0)),
+                        agent_action=agent_action_np,
+                    )
+                )
+
+                if len(video_steps) >= self.context_frames:
+                    end_idx = len(video_steps) - 1
+                    self.samples.append((video_path, video_id, end_idx))
 
         if not self.samples:
             raise RuntimeError(
                 "Found videos but no usable context windows. Ensure .jsonl files align with videos."
             )
-
-    def _cache_video_data(
-        self, 
-        video_id: int, 
-        step_infos: list[Dict[str, object]], 
-        agent_actions: list[Dict[str, np.ndarray]], 
-        esc_flags: list[int]
-    ) -> None:
-        """Stores video action data in the LRU cache."""
-        frame_map = {step["frame_idx"]: idx for idx, step in enumerate(step_infos)}
-        
-        data = {
-            "step_infos": step_infos,
-            "agent_actions": agent_actions,
-            "esc_flags": esc_flags,
-            "frame_map": frame_map
-        }
-        
-        self._action_cache[video_id] = data
-        if video_id in self._action_cache_order:
-            self._action_cache_order.remove(video_id)
-        self._action_cache_order.append(video_id)
-        
-        if len(self._action_cache_order) > self._max_cached_actions:
-            oldest = self._action_cache_order.pop(0)
-            self._action_cache.pop(oldest, None)
-
-    def _get_video_data(self, video_id: int) -> dict:
-        """Retrieves video action data, loading it if necessary."""
-        if video_id in self._action_cache:
-            # Refresh LRU
-            if video_id in self._action_cache_order:
-                self._action_cache_order.remove(video_id)
-            self._action_cache_order.append(video_id)
-            return self._action_cache[video_id]
-            
-        # Load data
-        video_path = self._video_paths[video_id]
-        action_path = video_path.with_suffix(".jsonl")
-        
-        step_infos, agent_actions_list, esc_flags_list, _ = process_video_actions(
-            video_path, action_path, self.context_frames, check_video_frame_count=True
-        )
-        
-        if not step_infos:
-             # This should not happen if it was valid during build_index, unless file changed/moved
-             raise RuntimeError(f"Failed to reload actions for {video_path}")
-
-        self._cache_video_data(video_id, step_infos, agent_actions_list, esc_flags_list)
-        return self._action_cache[video_id]
 
     def _get_capture(self, video_path: Path) -> cv2.VideoCapture:
         cap = self._capture_cache.get(video_path)
@@ -220,15 +221,28 @@ class MineWorldFrameDataset(Dataset):
         tensor = torch.from_numpy(frame)
         return tensor
 
+    def _env_action_to_agent_np(self, env_action: Dict[str, object]) -> Dict[str, np.ndarray]:
+        camera = np.asarray(env_action["camera"], dtype=np.float32)
+        env_format: Dict[str, np.ndarray] = {
+            "camera": camera[None],
+        }
+        for button_name in Buttons.ALL:
+            env_format[button_name] = np.asarray([env_action.get(button_name, 0)], dtype=np.int64)
+
+        minerl_action = self.action_transformer.env2policy(env_format)
+        if minerl_action["camera"].ndim == 1:
+            minerl_action = {k: v[None] for k, v in minerl_action.items()}
+        agent_action_np = self.action_mapper.from_factored(minerl_action)
+        agent_action: Dict[str, np.ndarray] = {}
+        for key, value in agent_action_np.items():
+            agent_action[key] = value[0].copy()
+        return agent_action
+
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state["_capture_cache"] = {}
         state["_last_frame_index"] = {}
         state["_capture_order"] = []
-        # Clear action cache in state if pickling to save space/avoid serialization issues?
-        # Assuming we can reload.
-        state["_action_cache"] = {}
-        state["_action_cache_order"] = []
         return state
 
     def __del__(self) -> None:
@@ -240,11 +254,7 @@ class MineWorldFrameDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         video_path, video_id, end_idx = self.samples[index]
-        
-        # Retrieve cached data
-        video_data = self._get_video_data(video_id)
-        step_infos = video_data["step_infos"]
-        
+        step_infos = self.video_step_infos[video_id]
         start_idx = end_idx - self.context_frames + 1
         cached = self._window_cache.get(int(video_id))
         cache_hit = cached is not None and cached[0] == end_idx - 1
@@ -277,19 +287,17 @@ class MineWorldFrameDataset(Dataset):
                         (self.context_frames, *tensor.shape),
                         dtype=tensor.dtype,
                         device=tensor.device,
-                        device=tensor.device,
                     )
                 frames_tensor[offset] = tensor
         assert frames_tensor is not None
         self._window_cache[int(video_id)] = (end_idx, frames_tensor.clone())
 
         final_step = step_infos[end_idx]
-        # Direct access from cached lists
-        agent_action = video_data["agent_actions"][end_idx]
-        esc_val = video_data["esc_flags"][end_idx]
-        
+        # Construct a compact, tensor-friendly label from the already-discretized agent action
+        agent_action = self.agent_actions[(int(video_id), int(final_step["frame_idx"]))]
         buttons_idx = int(agent_action["buttons"][0])
         camera_idx = int(agent_action["camera"][0])
+        esc_val = self.get_esc_flag(int(video_id), int(final_step["frame_idx"]))
         label = torch.tensor([buttons_idx, camera_idx, esc_val], dtype=torch.long)
         return (
             frames_tensor,
@@ -299,31 +307,18 @@ class MineWorldFrameDataset(Dataset):
         )
 
     def get_agent_action(self, video_id: int, frame_idx: int) -> Dict[str, torch.Tensor]:
-        video_data = self._get_video_data(video_id)
-        frame_map = video_data["frame_map"]
-        
-        list_idx = frame_map.get(int(frame_idx))
-        if list_idx is None:
+        agent_np = self.agent_actions.get((int(video_id), int(frame_idx)))
+        if agent_np is None:
             raise KeyError(f"Missing agent action for video_id={video_id}, frame_idx={frame_idx}")
-            
-        agent_np = video_data["agent_actions"][list_idx]
         return {key: torch.from_numpy(value.copy()) for key, value in agent_np.items()}
 
     def get_esc_flag(self, video_id: int, frame_idx: int) -> int:
-        try:
-            video_data = self._get_video_data(video_id)
-            frame_map = video_data["frame_map"]
-            list_idx = frame_map.get(int(frame_idx))
-            if list_idx is None:
-                return 0
-            return int(video_data["esc_flags"][list_idx])
-        except Exception:
-            return 0
+        return int(self.esc_actions.get((int(video_id), int(frame_idx)), 0))
 
     def get_frame_index(self, video_id: int, step_position: int) -> int:
-        video_data = self._get_video_data(video_id)
-        video_steps = video_data["step_infos"]
-        
+        video_steps = self.video_step_infos.get(int(video_id))
+        if video_steps is None:
+            raise KeyError(f"Unknown video_id={video_id}")
         if step_position < 0 or step_position >= len(video_steps):
             raise IndexError(
                 f"step_position={step_position} out of range for video_id={video_id} "
@@ -380,9 +375,6 @@ class MineWorldDecodedFrameDataset(Dataset):
         self._decoded_cache: dict[int, dict[str, torch.Tensor]] = {}
         self._cache_order: list[int] = []
         self._max_cached_videos = max(1, int(max_cached_videos))
-        self.video_step_infos: dict[int, list[Dict[str, object]]] = {}
-        self.agent_actions: dict[tuple[int, int], Dict[str, np.ndarray]] = {}
-        self.esc_actions: dict[tuple[int, int], int] = {}
 
         for entry in videos:
             video_id = int(entry["video_id"])
@@ -402,8 +394,9 @@ class MineWorldDecodedFrameDataset(Dataset):
                 "original_video": entry.get("original_video"),
             }
             # Track frame indices for compatibility with sequential logic in training scripts.
-            step_infos = [{"frame_idx": int(idx)} for idx in range(num_steps)]
-            self.video_step_infos[video_id] = step_infos
+            # REMOVED: self.video_step_infos which consumed massive memory for no reason.
+            # step_infos = [{"frame_idx": int(idx)} for idx in range(num_steps)]
+            # self.video_step_infos[video_id] = step_infos
             for end_idx in range(self.context_frames - 1, num_steps):
                 self.samples.append((decoded_path, video_id, end_idx))
 
