@@ -24,6 +24,8 @@ python scripts/train_initial_bc.py \
 from __future__ import annotations
 
 import argparse
+import cProfile
+import pstats
 import random
 import sys
 from copy import deepcopy
@@ -38,18 +40,18 @@ from collections import Counter
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, Sampler
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 import wandb
+import torchvision.transforms.functional as TVF
+from torchvision.transforms import InterpolationMode
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from datasets.mineworld_data.mineworld_frame_dataset import (
-    MineWorldFrameDataset,
-    MineWorldDecodedFrameDataset,
-)
+from datasets.mineworld_data.mineworld_frame_dataset import MineWorldFrameDataset
+from evaluation.agent import AGENT_RESOLUTION
 from utils.SequentialBatchSampler import PerVideoSequentialBatchSampler
 
 CONFIG_DIR = ROOT_DIR / "configurations"
@@ -98,12 +100,6 @@ def _entropy_from_logprobs(log_probs: torch.Tensor) -> torch.Tensor:
     probs = log_probs.exp()
     entropy = -(probs * log_probs).sum(dim=-1)
     return entropy.mean()
-
-DATASET_REGISTRY = {
-    "mineworld_frames": MineWorldFrameDataset,
-    "mineworld_decoded_frames": MineWorldDecodedFrameDataset,
-}
-
 
 def _estimate_button_class_weights(
     dataset: MineWorldFrameDataset,
@@ -186,29 +182,6 @@ def _coerce_policy_config(raw_cfg: Dict, dataset: MineWorldFrameDataset) -> Poli
         )
     return PolicyConfig(**filtered_cfg)
 
-def _build_dataset(
-    dataset_name: str,
-    data_root: Path,
-    context_frames: int,
-    dataset_cfg: Dict,
-    recursive: bool,
-) -> MineWorldFrameDataset:
-    dataset_cls = DATASET_REGISTRY.get(dataset_name, MineWorldFrameDataset)
-    if dataset_cls is MineWorldDecodedFrameDataset:
-        return dataset_cls(
-            decoded_root=data_root,
-            context_frames=context_frames,
-            manifest_name=dataset_cfg.get("manifest_name", "manifest.json"),
-            max_cached_videos=int(dataset_cfg.get("max_cached_videos", 4)),
-        )
-    return dataset_cls(
-        data_root=data_root,
-        context_frames=context_frames,
-        recursive=recursive,
-        max_open_captures=int(dataset_cfg.get("max_open_captures", 12)),
-    )
-
-
 def train_initial_bc(
     data_root: Path,
     fraction: float,
@@ -224,10 +197,17 @@ def train_initial_bc(
     dataset_name: str,
     exp_cfg: Dict,
     label_smoothing: Optional[float],
+    profiler: Optional[cProfile.Profile] = None,
 ) -> None:
 
     #initialize dataset
-    dataset = _build_dataset(dataset_name, data_root, context_frames, dataset_cfg, recursive)
+    dataset = MineWorldFrameDataset(
+        data_root=data_root,
+        context_frames=context_frames,
+        recursive=recursive,
+        max_open_captures=int(dataset_cfg.get("max_open_captures", 12)),
+        defer_preprocessing=True,
+    )
     policy_cfg = _coerce_policy_config(policy_cfg_dict, dataset)
     train_cfg = exp_cfg.get("training", {})
     opt_cfg = exp_cfg.get("optimizer", {})
@@ -253,56 +233,33 @@ def train_initial_bc(
     )
     print(f"Button weight tensor: {button_weight_tensor}")
     video_ids = list(video_to_indices.keys())
-    if len(video_ids) < 2:
-        raise ValueError(
-            "Need at least two trajectories to reserve one for validation while keeping the rest for training."
-        )
+    if not video_ids:
+        raise ValueError("Need at least one trajectory for training.")
     random.shuffle(video_ids)
 
-    # Reserve exactly one entire trajectory for validation; keep remaining
-    # whole trajectories for training while respecting the fraction budget at
-    # the granularity of complete videos.
-    val_video_id = video_ids[0]
-    train_candidate_videos = video_ids[1:]
-    if not train_candidate_videos:
-        raise ValueError(
-            "Need at least two trajectories to create a train/val split that preserves full videos."
-        )
-
-    val_indices = list(video_to_indices[val_video_id])
-    target_train_samples = max(0, subset_len - len(val_indices))
     limit_train_subset = fraction < 1.0
+    remaining = subset_len
     train_indices: List[int] = []
-    selected_train_videos: List[int] = []
-    for vid in train_candidate_videos:
-        if limit_train_subset and target_train_samples <= 0 and selected_train_videos:
+    for vid in video_ids:
+        if limit_train_subset and remaining <= 0 and train_indices:
             break
         train_indices.extend(video_to_indices[vid])
-        selected_train_videos.append(vid)
-        target_train_samples -= len(video_to_indices[vid])
+        remaining -= len(video_to_indices[vid])
     if not train_indices:
-        # Fall back to the first remaining trajectory so training is non-empty.
-        first_vid = train_candidate_videos[0]
+        first_vid = video_ids[0]
         train_indices = list(video_to_indices[first_vid])
-        selected_train_videos = [first_vid]
 
     train_subset = Subset(dataset, train_indices)
-    val_subset = Subset(dataset, val_indices)
-    effective_total = max(1, len(train_indices) + len(val_indices))
-    val_fraction = len(val_indices) / effective_total
 
     train_video_to_positions: Dict[int, List[int]] = {}
     for subset_idx, dataset_idx in enumerate(train_indices):
         _, vid, _ = dataset.samples[dataset_idx]
         train_video_to_positions.setdefault(int(vid), []).append(subset_idx)
 
-
     # load in training parameters
     train_batch_size = batch_size
     train_epochs = epochs
     train_workers = int(train_cfg.get("num_workers", 4))
-    val_batch_size = int(train_cfg.get("val_batch_size", train_batch_size))
-    val_workers = int(train_cfg.get("val_num_workers", max(1, train_workers // 2)))
     checkpoint_interval = int(train_cfg.get("checkpoint_interval", 1))
     camera_gate_weight = float(train_cfg.get("camera_gate_weight", 1.0))
     entropy_weight = float(train_cfg.get("entropy_weight", 0.0))
@@ -322,10 +279,8 @@ def train_initial_bc(
             "epochs": train_epochs,
             "batch_size": train_batch_size,
             "context_frames": context_frames,
-            "val_fraction": val_fraction,
             "seed": random_seed,
             "train_samples": len(train_subset),
-            "val_samples": len(val_subset),
             "grad_clip_norm": grad_clip_norm if grad_clip_norm is not None else 0.0,
             "label_smoothing": label_smoothing,
             "camera_gate_weight": camera_gate_weight,
@@ -337,27 +292,41 @@ def train_initial_bc(
     )
 
     # initialize data loader
-    # prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
-    # train_batch_sampler = PerVideoSequentialBatchSampler(
-    #     video_to_positions=train_video_to_positions,
-    #     batch_size=train_batch_size,
-    #     seed=random_seed,
-    # )
-    prefetch_factor = int(train_cfg.get("prefetch_factor", 4))
+    prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
+    # train_batch_sampler: PerVideoSequentialBatchSampler | None = None
+    # unique_train_videos = len(train_video_to_positions)
+    # if unique_train_videos >= train_batch_size:
+    #     try:
+    #         train_batch_sampler = PerVideoSequentialBatchSampler(
+    #             video_to_positions=train_video_to_positions,
+    #             batch_size=train_batch_size,
+    #             seed=random_seed,
+    #             drop_last=False,
+    #         )
+    #         print(
+    #             f"Using per-video sequential sampler for {unique_train_videos} videos "
+    #             "to minimize random frame seeks."
+    #         )
+    #     except ValueError as exc:
+    #         print(f"Falling back to shuffled batches: {exc}")
+    #         train_batch_sampler = None
+    # else:
+    #     print(
+    #         f"Falling back to shuffled batches "
+    #         f"(batch_size={train_batch_size} exceeds unique videos={unique_train_videos})."
+    #     )
 
-    # loader_kwargs = dict(
-    #     batch_sampler=train_batch_sampler,
-    #     num_workers=train_workers,
-    #     pin_memory=True,
-    #     persistent_workers=True,  # Disabled to avoid stale VideoCapture objects across epochs
-    # )
     loader_kwargs = dict(
         batch_size=train_batch_size,
-        shuffle=True,
         num_workers=train_workers,
         pin_memory=True,
-        persistent_workers=True 
+        persistent_workers=False,
     )
+    # if train_batch_sampler is not None:
+    #     loader_kwargs["batch_sampler"] = train_batch_sampler
+    # else:
+    #     loader_kwargs["batch_size"] = train_batch_size
+    #     loader_kwargs["shuffle"] = True
     if train_workers > 0:
         loader_kwargs["prefetch_factor"] = max(prefetch_factor, 1)
     loader = DataLoader(train_subset, **loader_kwargs)
@@ -373,11 +342,31 @@ def train_initial_bc(
     channel_std = IMAGENET_STD.view(1, 1, 3, 1, 1).to(device)
     camera_null_idx = dataset.action_mapper.camera_null_idx
     smoothing = float(label_smoothing if label_smoothing is not None else 0.0)
+    defer_preprocess = getattr(dataset, "defer_preprocessing", False)
+    agent_resolution = tuple(AGENT_RESOLUTION)
+    target_width = int(agent_resolution[0])
+    target_height = int(agent_resolution[1] if len(agent_resolution) > 1 else agent_resolution[0])
+    resize_hw = (target_height, target_width)
 
     def _prepare_observations(frames: torch.Tensor) -> torch.Tensor:
-        frames = frames.permute(0, 1, 4, 2, 3).contiguous()
-        frames = frames.to(device, dtype=torch.float32, non_blocking=True)
-        frames = frames.div(255.0)
+        if defer_preprocess:
+            batch_size, context_frames_count, frame_h, frame_w, channels = frames.shape
+            frames = frames.to(device, dtype=torch.uint8, non_blocking=True).contiguous()
+            frames = frames.view(batch_size * context_frames_count, frame_h, frame_w, channels)
+            frames = frames.permute(0, 3, 1, 2).contiguous()
+            frames = frames[:, [2, 1, 0], :, :]  # BGR -> RGB
+            frames = TVF.resize(
+                frames,
+                resize_hw,
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            frames = frames.view(batch_size, context_frames_count, 3, resize_hw[0], resize_hw[1])
+            frames = frames.to(dtype=torch.float32).div_(255.0)
+        else:
+            frames = frames.permute(0, 1, 4, 2, 3).contiguous()
+            frames = frames.to(device, dtype=torch.float32, non_blocking=True)
+            frames = frames.div_(255.0)
         return (frames - channel_mean) / channel_std
 
     def save_checkpoint(suffix: str | None = None) -> Path:
@@ -397,19 +386,7 @@ def train_initial_bc(
         weight_decay=float(opt_cfg.get("weight_decay", 1e-4)),
     )
 
-    val_prefetch_factor = int(train_cfg.get("val_prefetch_factor", prefetch_factor))
-    val_loader_kwargs = dict(
-        batch_size=val_batch_size,
-        num_workers=val_workers,
-        pin_memory=True,
-        shuffle=False,
-        persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
-    )
-    if val_workers > 0:
-        val_loader_kwargs["prefetch_factor"] = max(val_prefetch_factor, 1)
-    val_loader = DataLoader(val_subset, **val_loader_kwargs)
-
-    def run_epoch(data_loader, train: bool):
+    def run_epoch(data_loader, train: bool, max_batches: Optional[int] = None):
         running_loss = 0.0
         running_examples = 0
         running_action_correct = 0
@@ -421,7 +398,7 @@ def train_initial_bc(
         model.train(mode=train)
         sample_outputs: list[tuple[dict[str, list[int]], dict[str, list[int]]]] = []
         iterator = tqdm(data_loader, desc="train" if train else "val", leave=False)
-        for batch in iterator:
+        for batch_idx, batch in enumerate(iterator):
             observations, _, video_ids, frame_indices = batch
             frames = _prepare_observations(observations)
             video_ids_list = video_ids.cpu().tolist()
@@ -531,6 +508,8 @@ def train_initial_bc(
                 if "esc" in last_logits:
                     postfix["loss_esc"] = f"{esc_loss.detach().item():.3f}"
                 iterator.set_postfix(postfix)
+            if max_batches is not None and (batch_idx + 1) >= max_batches:
+                break
 
         if running_examples == 0:
             return 0.0, None, sample_outputs, {"buttons": None, "camera": None, "esc": None}
@@ -547,9 +526,14 @@ def train_initial_bc(
             {"buttons": avg_buttons_loss, "camera": avg_camera_loss, "esc": avg_esc_loss},
         )
 
+    profiler_enabled = False
     for epoch in range(train_epochs):
-        train_loss, train_acc, train_samples, train_comp = run_epoch(loader, train=True)
-        val_loss, val_acc, val_samples, val_comp = run_epoch(val_loader, train=False)
+        if profiler is not None and not profiler_enabled:
+            profiler.enable()
+            profiler_enabled = True
+        train_loss, train_acc, train_samples, train_comp = run_epoch(
+            loader, train=True, max_batches=5
+        )
 
         metrics = {
             "train/loss": train_loss,
@@ -562,44 +546,19 @@ def train_initial_bc(
             metrics["train/loss_esc"] = train_comp["esc"]
         if train_acc is not None:
             metrics["train/acc"] = train_acc
-        if val_loss is not None:
-            metrics["val/loss"] = val_loss
-            if val_comp.get("buttons") is not None:
-                metrics["val/loss_buttons"] = val_comp["buttons"]
-            if val_comp.get("camera") is not None:
-                metrics["val/loss_camera"] = val_comp["camera"]
-            if val_comp.get("esc") is not None:
-                metrics["val/loss_esc"] = val_comp["esc"]
-            if val_acc is not None:
-                metrics["val/acc"] = val_acc
         wandb.log(metrics, step=epoch + 1)
         train_acc_str = f"{train_acc:.4f}" if train_acc is not None else "n/a"
-        val_acc_str = f"{val_acc:.4f}" if val_acc is not None else "n/a"
-        if val_loss is not None:
-            print(
-                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc_str} "
-                f"- val_loss: {val_loss:.4f} - val_acc: {val_acc_str} "
-            )
-            if train_samples:
-                print("Training samples (target vs. prediction):")
-                for idx, (target_tokens, pred_tokens) in enumerate(train_samples, start=1):
-                    print(f"  Sample {idx}:")
-                    for key in sorted(target_tokens.keys()):
-                        target_vals = target_tokens[key]
-                        pred_vals = pred_tokens.get(key, [])
-                        print(f"    {key}: target={target_vals} pred={pred_vals}")
-            if val_samples:
-                print("Validation samples (target vs. prediction):")
-                for idx, (target_tokens, pred_tokens) in enumerate(val_samples, start=1):
-                    print(f"  Sample {idx}:")
-                    for key in sorted(target_tokens.keys()):
-                        target_vals = target_tokens[key]
-                        pred_vals = pred_tokens.get(key, [])
-                        print(f"    {key}: target={target_vals} pred={pred_vals}")
-        else:
-            print(
-                f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc_str} "
-            )
+        print(
+            f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.4f} - acc: {train_acc_str} "
+        )
+        if train_samples:
+            print("Training samples (target vs. prediction):")
+            for idx, (target_tokens, pred_tokens) in enumerate(train_samples, start=1):
+                print(f"  Sample {idx}:")
+                for key in sorted(target_tokens.keys()):
+                    target_vals = target_tokens[key]
+                    pred_vals = pred_tokens.get(key, [])
+                    print(f"    {key}: target={target_vals} pred={pred_vals}")
         if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
             ckpt_path = save_checkpoint(f"epoch{epoch + 1:03d}")
             print(f"Saved checkpoint to {ckpt_path}")
@@ -676,11 +635,29 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Label smoothing coefficient for BC loss (overrides config).",
     )
+    parser.add_argument(
+        "--profile-output",
+        type=Path,
+        default=None,
+        help="Optional path to dump raw cProfile stats (.prof).",
+    )
+    parser.add_argument(
+        "--profile-sort",
+        type=str,
+        default="tottime",
+        choices=["tottime", "cumtime"],
+        help="Stat sort key printed after profiling.",
+    )
+    parser.add_argument(
+        "--profile-limit",
+        type=int,
+        default=40,
+        help="Number of lines to print from the cProfile report.",
+    )
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def main(args: argparse.Namespace) -> None:
     dataset_cfg, policy_cfg_dict, exp_cfg = _load_hydra_configs(
         dataset_name=args.dataset, algorithm_name='policy_bc', experiment_name='mineworld_bc_train'
     )
@@ -739,4 +716,18 @@ if __name__ == "__main__":
         dataset_name=dataset_name,
         exp_cfg=exp_cfg,
         label_smoothing=args.label_smoothing,
+        profiler=args.profiler,
     )
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    profiler = cProfile.Profile()
+    args.profiler = profiler
+    try:
+        main(args)
+    finally:
+        stats = pstats.Stats(profiler).sort_stats(args.profile_sort)
+        stats.print_stats(max(1, int(args.profile_limit)))
+        if args.profile_output:
+            stats.dump_stats(str(args.profile_output))

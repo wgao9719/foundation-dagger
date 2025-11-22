@@ -1,0 +1,12 @@
+defaults:
+  - base_video
+  - _self_
+
+name: mineworld_decoded_frames
+# Root directory containing decoded MineWorld tensors produced by decode_mineworld_frames.py
+data_root: data/mineworld_decoded/train
+
+context_frames: 1
+manifest_name: manifest.json
+max_cached_videos: 4
+recursive: false

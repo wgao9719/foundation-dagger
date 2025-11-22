@@ -7,10 +7,11 @@ training:
   val_fraction: 0.001
   seed: 0
   checkpoint_interval: 1
-  num_workers: 48
+  num_workers: 16
   #num_workers: 10
   val_num_workers: 4
   #val_num_workers: 2
+  block_shuffle_size: 256
   #camera_gate_weight: 1.0
   camera_gate_weight: 1.0
   esc_loss_weight: 0.8  # may cause issues with train_vpt (not integrated there)
