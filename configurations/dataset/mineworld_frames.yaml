@@ -18,5 +18,6 @@ recursive: true
 val_fraction: 0.1
 seed: 0
 max_open_captures: 12
+max_cached_videos: 4
 
 output: checkpoints/bc_policy.ckpt

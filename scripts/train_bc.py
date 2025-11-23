@@ -201,6 +201,7 @@ def _build_dataset(
             context_frames=context_frames,
             manifest_name=dataset_cfg.get("manifest_name", "manifest.json"),
             max_cached_videos=int(dataset_cfg.get("max_cached_videos", 4)),
+            use_memmap_frames=bool(dataset_cfg.get("use_memmap_frames", True)),
         )
     return dataset_cls(
         data_root=data_root,

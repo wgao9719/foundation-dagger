@@ -9,4 +9,5 @@ data_root: data/mineworld_decoded/train
 context_frames: 1
 manifest_name: manifest.json
 max_cached_videos: 4
+use_memmap_frames: true
 recursive: false

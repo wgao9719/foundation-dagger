@@ -120,8 +120,6 @@ def _decode_video_job(job: Dict[str, object]) -> Dict[str, object]:
         if current_frame_idx < next_target:
             continue
         if current_frame_idx > next_target:
-            # This should not happen because we advance frame_idx one at a time,
-            # but guard anyway to avoid infinite loops.
             continue
 
         while target_pos < total_targets and target_indices[target_pos] == current_frame_idx:

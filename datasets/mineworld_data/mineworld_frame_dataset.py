@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Dict, List
 
@@ -345,6 +346,7 @@ class MineWorldDecodedFrameDataset(Dataset):
         context_frames: int = 8,
         manifest_name: str = "manifest.json",
         max_cached_videos: int = 4,
+        use_memmap_frames: bool = True,
     ) -> None:
         self.data_root = Path(decoded_root)
         if not self.data_root.exists():
@@ -375,6 +377,7 @@ class MineWorldDecodedFrameDataset(Dataset):
         self._decoded_cache: dict[int, dict[str, torch.Tensor]] = {}
         self._cache_order: list[int] = []
         self._max_cached_videos = max(1, int(max_cached_videos))
+        self._use_memmap_frames = bool(use_memmap_frames)
 
         for entry in videos:
             video_id = int(entry["video_id"])
@@ -392,6 +395,8 @@ class MineWorldDecodedFrameDataset(Dataset):
             self._video_records[video_id] = {
                 "path": decoded_path,
                 "original_video": entry.get("original_video"),
+                "memmap_path": self._frames_memmap_path(decoded_path),
+                "meta_path": self._metadata_path(decoded_path),
             }
             # Track frame indices for compatibility with sequential logic in training scripts.
             # REMOVED: self.video_step_infos which consumed massive memory for no reason.
@@ -443,6 +448,79 @@ class MineWorldDecodedFrameDataset(Dataset):
         state["_cache_order"] = []
         return state
 
+    def _frames_memmap_path(self, decoded_path: Path) -> Path:
+        return decoded_path.with_suffix(".frames.npy")
+
+    def _metadata_path(self, decoded_path: Path) -> Path:
+        return decoded_path.with_suffix(".meta.pt")
+
+    def _write_frames_memmap(self, memmap_path: Path, frames: torch.Tensor) -> None:
+        memmap_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = Path(f"{memmap_path}.tmp")
+        shape = tuple(int(dim) for dim in frames.shape)
+        arr = np.lib.format.open_memmap(
+            tmp_path,
+            mode="w+",
+            dtype=np.uint8,
+            shape=shape,
+        )
+        arr[...] = frames.cpu().numpy()
+        arr.flush()
+        os.replace(tmp_path, memmap_path)
+
+    def _write_metadata(self, meta_path: Path, metadata: dict[str, torch.Tensor]) -> None:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = Path(f"{meta_path}.tmp")
+        torch.save(metadata, tmp_path)
+        os.replace(tmp_path, meta_path)
+
+    def _extract_metadata(self, payload: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {
+            "frame_indices": payload["frame_indices"].to(torch.long).contiguous(),
+            "buttons": payload["buttons"].to(torch.long).contiguous(),
+            "camera": payload["camera"].to(torch.long).contiguous(),
+            "esc": payload["esc"].to(torch.long).contiguous(),
+        }
+
+    def _load_memmap_bundle(
+        self,
+        record: dict[str, object],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], np.memmap | None]:
+        decoded_path = record["path"]
+        assert isinstance(decoded_path, Path)
+        if not self._use_memmap_frames:
+            base_data = torch.load(decoded_path, map_location="cpu")
+            frames_tensor = base_data["frames"].contiguous()
+            metadata = self._extract_metadata(base_data)
+            return frames_tensor, metadata, None
+        memmap_path = record.get("memmap_path")
+        meta_path = record.get("meta_path")
+        if not isinstance(memmap_path, Path):
+            memmap_path = self._frames_memmap_path(decoded_path)
+        if not isinstance(meta_path, Path):
+            meta_path = self._metadata_path(decoded_path)
+
+        if not memmap_path.exists() or not meta_path.exists():
+            base_data = torch.load(decoded_path, map_location="cpu")
+            frames_tensor = base_data["frames"].contiguous()
+            metadata = self._extract_metadata(base_data)
+            if self._use_memmap_frames:
+                try:
+                    self._write_frames_memmap(memmap_path, frames_tensor)
+                    self._write_metadata(meta_path, metadata)
+                    frames_memmap = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
+                    frames_tensor = torch.from_numpy(frames_memmap)
+                    return frames_tensor, metadata, frames_memmap
+                except OSError:
+                    # Fall back to in-memory storage if mmap creation fails.
+                    pass
+            return frames_tensor, metadata, None
+
+        metadata = torch.load(meta_path, map_location="cpu")
+        frames_memmap = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
+        frames_tensor = torch.from_numpy(frames_memmap)
+        return frames_tensor, metadata, frames_memmap
+
     def _load_video_bundle(self, video_id: int) -> dict:
         video_id = int(video_id)
         cached = self._decoded_cache.get(video_id)
@@ -451,23 +529,19 @@ class MineWorldDecodedFrameDataset(Dataset):
         record = self._video_records.get(video_id)
         if record is None:
             raise KeyError(f"Unknown decoded video_id={video_id}")
-        path = record["path"]
-        data = torch.load(path, map_location="cpu")
-        required_keys = {"frames", "frame_indices", "buttons", "camera", "esc"}
-        missing = required_keys.difference(data.keys())
-        if missing:
-            raise KeyError(
-                f"Decoded file {path} missing required keys: {', '.join(sorted(missing))}"
-            )
-        # Ensure tensors use consistent dtypes and layouts.
-        data["frames"] = data["frames"].contiguous()
-        data["frame_indices"] = data["frame_indices"].to(torch.long).contiguous()
-        data["buttons"] = data["buttons"].to(torch.long).contiguous()
-        data["camera"] = data["camera"].to(torch.long).contiguous()
-        data["esc"] = data["esc"].to(torch.long).contiguous()
-        data["_frame_to_local"] = {
-            int(idx): pos for pos, idx in enumerate(data["frame_indices"].tolist())
+        frames_tensor, metadata, frames_memmap = self._load_memmap_bundle(record)
+        data = {
+            "frames": frames_tensor,
+            "frame_indices": metadata["frame_indices"],
+            "buttons": metadata["buttons"],
+            "camera": metadata["camera"],
+            "esc": metadata["esc"],
+            "_frame_to_local": {
+                int(idx): pos for pos, idx in enumerate(metadata["frame_indices"].tolist())
+            },
         }
+        if frames_memmap is not None:
+            data["_frames_memmap"] = frames_memmap
         self._decoded_cache[video_id] = data
         if video_id in self._cache_order:
             self._cache_order.remove(video_id)
