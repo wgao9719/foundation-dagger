@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -466,6 +466,7 @@ class MineWorldDecodedFrameDataset(Dataset):
         )
         arr[...] = frames.cpu().numpy()
         arr.flush()
+        del arr  # Ensure the file is closed before moving
         os.replace(tmp_path, memmap_path)
 
     def _write_metadata(self, meta_path: Path, metadata: dict[str, torch.Tensor]) -> None:
@@ -473,6 +474,14 @@ class MineWorldDecodedFrameDataset(Dataset):
         tmp_path = Path(f"{meta_path}.tmp")
         torch.save(metadata, tmp_path)
         os.replace(tmp_path, meta_path)
+
+    def _safe_unlink(self, path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
     def _extract_metadata(self, payload: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {
@@ -485,14 +494,19 @@ class MineWorldDecodedFrameDataset(Dataset):
     def _load_memmap_bundle(
         self,
         record: dict[str, object],
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], np.memmap | None]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], Optional[np.memmap]]:
         decoded_path = record["path"]
         assert isinstance(decoded_path, Path)
-        if not self._use_memmap_frames:
+
+        def _load_in_memory() -> tuple[torch.Tensor, dict[str, torch.Tensor], None]:
             base_data = torch.load(decoded_path, map_location="cpu")
             frames_tensor = base_data["frames"].contiguous()
             metadata = self._extract_metadata(base_data)
             return frames_tensor, metadata, None
+
+        if not self._use_memmap_frames:
+            return _load_in_memory()
+
         memmap_path = record.get("memmap_path")
         meta_path = record.get("meta_path")
         if not isinstance(memmap_path, Path):
@@ -500,26 +514,37 @@ class MineWorldDecodedFrameDataset(Dataset):
         if not isinstance(meta_path, Path):
             meta_path = self._metadata_path(decoded_path)
 
-        if not memmap_path.exists() or not meta_path.exists():
-            base_data = torch.load(decoded_path, map_location="cpu")
-            frames_tensor = base_data["frames"].contiguous()
-            metadata = self._extract_metadata(base_data)
+        def _rebuild_memmap() -> tuple[torch.Tensor, dict[str, torch.Tensor], Optional[np.memmap]]:
+            frames_tensor, metadata, _ = _load_in_memory()
             if self._use_memmap_frames:
                 try:
                     self._write_frames_memmap(memmap_path, frames_tensor)
                     self._write_metadata(meta_path, metadata)
-                    frames_memmap = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
-                    frames_tensor = torch.from_numpy(frames_memmap)
-                    return frames_tensor, metadata, frames_memmap
+                    frames_memmap = np.load(memmap_path, mmap_mode="c", allow_pickle=False)
+                    return torch.from_numpy(frames_memmap), metadata, frames_memmap
                 except OSError:
-                    # Fall back to in-memory storage if mmap creation fails.
-                    pass
+                    self._safe_unlink(memmap_path)
+                    self._safe_unlink(meta_path)
             return frames_tensor, metadata, None
 
-        metadata = torch.load(meta_path, map_location="cpu")
-        frames_memmap = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
-        frames_tensor = torch.from_numpy(frames_memmap)
-        return frames_tensor, metadata, frames_memmap
+        if not memmap_path.exists() or not meta_path.exists():
+            return _rebuild_memmap()
+
+        try:
+            metadata = torch.load(meta_path, map_location="cpu")
+        except (OSError, RuntimeError):
+            self._safe_unlink(meta_path)
+            self._safe_unlink(memmap_path)
+            return _rebuild_memmap()
+
+        try:
+            frames_memmap = np.load(memmap_path, mmap_mode="c", allow_pickle=False)
+            frames_tensor = torch.from_numpy(frames_memmap)
+            return frames_tensor, metadata, frames_memmap
+        except (ValueError, OSError):
+            self._safe_unlink(memmap_path)
+            self._safe_unlink(meta_path)
+            return _rebuild_memmap()
 
     def _load_video_bundle(self, video_id: int) -> dict:
         video_id = int(video_id)

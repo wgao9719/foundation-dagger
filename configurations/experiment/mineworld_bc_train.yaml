@@ -2,12 +2,12 @@ defaults:
   - _self_
 
 training:
-  batch_size: 32
+  batch_size: 128
   epochs: 30
   val_fraction: 0.001
   seed: 0
-  checkpoint_interval: 1
-  num_workers: 24
+  checkpoint_interval: 2
+  num_workers: 32
   #num_workers: 10
   val_num_workers: 4
   #val_num_workers: 2
@@ -17,7 +17,7 @@ training:
   entropy_weight: 0.002
   button_weight_videos: 3
   button_weight_temperature: 0.6
-  prefetch_factor: 4
+  prefetch_factor: 6
 
 scheduler:
   name: cosine
@@ -31,8 +31,8 @@ scheduler:
   
 # Fine-tuning
 optimizer:
-  lr: 0.001
-  weight_decay: 0.00001
+  lr: 0.003
+  weight_decay: 0.0001
   betas: [0.9, 0.95]
 
 # Full training
