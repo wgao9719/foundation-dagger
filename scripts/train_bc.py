@@ -40,6 +40,11 @@ from collections import Counter
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Sampler
+import torch.multiprocessing
+try:
+    torch.multiprocessing.set_sharing_strategy('file_system')
+except RuntimeError:
+    pass
 from tqdm.auto import tqdm
 import wandb
 
@@ -52,6 +57,7 @@ from datasets.mineworld_data.mineworld_frame_dataset import (
     MineWorldDecodedFrameDataset,
 )
 from utils.SequentialBatchSampler import PerVideoSequentialBatchSampler
+from utils.VideoGroupedSampler import VideoGroupedSampler, VideoSequentialSampler
 
 CONFIG_DIR = ROOT_DIR / "configurations"
 
@@ -314,6 +320,10 @@ def train_initial_bc(
     scheduler_name = scheduler_cfg.get("name")
     warmup_steps = int(scheduler_cfg.get("warmup_steps", 0))
     min_lr = float(scheduler_cfg.get("min_lr", 0.0))
+    
+    # Sampler config for cache-friendly data loading
+    sampler_chunk_size = int(train_cfg.get("sampler_chunk_size", 512))
+    use_locality_sampler = bool(train_cfg.get("use_locality_sampler", True))
 
     # initialize wandb
     wandb.init(
@@ -343,27 +353,65 @@ def train_initial_bc(
     )
 
     # initialize data loader
-    # prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
-    # train_batch_sampler = PerVideoSequentialBatchSampler(
-    #     video_to_positions=train_video_to_positions,
-    #     batch_size=train_batch_size,
-    #     seed=random_seed,
-    # )
     prefetch_factor = int(train_cfg.get("prefetch_factor", 4))
 
-    # loader_kwargs = dict(
-    #     batch_sampler=train_batch_sampler,
-    #     num_workers=train_workers,
-    #     pin_memory=True,
-    #     persistent_workers=True,  # Disabled to avoid stale VideoCapture objects across epochs
-    # )
-    loader_kwargs = dict(
-        batch_size=train_batch_size,
-        shuffle=True,
-        num_workers=train_workers,
-        pin_memory=True,
-        persistent_workers=True 
-    )
+    # Build sampler for cache-friendly data loading
+    # With many workers, each worker has its own video cache. Random shuffling causes
+    # constant cache misses as workers access samples from different videos.
+    # VideoGroupedSampler groups samples by video, ensuring workers access the same
+    # video multiple times before moving to the next, dramatically reducing disk I/O.
+    if use_locality_sampler:
+        # Build samples list for the training subset (need original sample tuples)
+        train_samples_for_sampler = [dataset.samples[i] for i in train_indices]
+        train_sampler = VideoGroupedSampler(
+            samples=train_samples_for_sampler,
+            chunk_size=sampler_chunk_size,
+            seed=random_seed,
+            shuffle_videos=True,
+            shuffle_within_video=True,
+        )
+        # Note: sampler indices are relative to train_samples_for_sampler,
+        # but we're using train_subset which expects indices relative to train_indices
+        # So we need a wrapper that maps sampler output to subset indices
+        
+        # Actually, VideoGroupedSampler returns indices into train_samples_for_sampler,
+        # which correspond directly to positions in train_indices. Since train_subset
+        # uses indices 0..len(train_indices)-1, we need the sampler to output those.
+        # Let's rebuild the sampler with subset-relative indices.
+        train_samples_subset_relative = [
+            (dataset.samples[orig_idx][0], dataset.samples[orig_idx][1], dataset.samples[orig_idx][2])
+            for orig_idx in train_indices
+        ]
+        # Map each subset index to its video_id for the sampler
+        subset_samples_with_idx = [
+            (None, dataset.samples[train_indices[i]][1], i)  # (path, video_id, subset_idx)
+            for i in range(len(train_indices))
+        ]
+        train_sampler = VideoGroupedSampler(
+            samples=subset_samples_with_idx,
+            chunk_size=sampler_chunk_size,
+            seed=random_seed,
+            shuffle_videos=True,
+            shuffle_within_video=True,
+        )
+        print(f"Using VideoGroupedSampler with chunk_size={sampler_chunk_size} for cache-friendly loading")
+        loader_kwargs = dict(
+            batch_size=train_batch_size,
+            sampler=train_sampler,
+            num_workers=train_workers,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+    else:
+        print("Using standard shuffle=True (may cause data loading delays with many workers)")
+        loader_kwargs = dict(
+            batch_size=train_batch_size,
+            shuffle=True,
+            num_workers=train_workers,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+    
     if train_workers > 0:
         loader_kwargs["prefetch_factor"] = max(prefetch_factor, 1)
     loader = DataLoader(train_subset, **loader_kwargs)
@@ -425,7 +473,7 @@ def train_initial_bc(
         num_workers=val_workers,
         pin_memory=True,
         shuffle=True,
-        persistent_workers=False,  # Disabled to avoid stale VideoCapture objects across epochs
+        persistent_workers=True,  # Disabled to avoid stale VideoCapture objects across epochs
     )
     if val_workers > 0:
         val_loader_kwargs["prefetch_factor"] = max(val_prefetch_factor, 1)
@@ -555,6 +603,9 @@ def train_initial_bc(
         )
 
     for epoch in range(train_epochs):
+        # Update sampler epoch for reproducible shuffling
+        if use_locality_sampler and hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(epoch)
         train_loss, train_acc, train_samples, train_comp = run_epoch(loader, train=True)
         val_loss, val_acc, val_samples, val_comp = run_epoch(val_loader, train=False)
 
