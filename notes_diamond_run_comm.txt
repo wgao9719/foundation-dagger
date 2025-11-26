@@ -1,0 +1,19 @@
+python scripts/train_minerl_bc.py \
+    --data-root data/task_diamond \
+    --epochs 50 \
+    --batch-size 512 \
+    --context-frames 1 \
+    --learning-rate 0.0003 \
+    --weight-decay 0.0001 \
+    --grad-clip-norm 2.0 \
+    --label-smoothing 0.05 \
+    --num-workers 16 \
+    --backbone resnet_18 \
+    --button-weight 1.0 \
+    --camera-weight 1.0 \
+    --categorical-weight 2.0 \
+    --class-weight-temperature 0.5 \
+    --seed 0 \
+    --checkpoint-interval 1 \
+    --output checkpoints/diamond_bc_1.ckpt
+
