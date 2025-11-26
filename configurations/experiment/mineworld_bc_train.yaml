@@ -3,18 +3,18 @@ defaults:
 
 training:
   batch_size: 512
-  epochs: 50
+  epochs: 100
   val_fraction: 0.004
   seed: 0
   checkpoint_interval: 1
   num_workers: 40
   val_num_workers: 2
   camera_gate_weight: 1.0
-  esc_loss_weight: 0.7  # may cause issues with train_vpt (not integrated there)
+  esc_loss_weight: 0.5  # may cause issues with train_vpt (not integrated there)
   grad_clip_norm: 2.0
   entropy_weight: 0.002
   button_weight_videos: 3
-  button_weight_temperature: 0.6
+  button_weight_temperature: 0.8
   prefetch_factor: 3
   # Locality-aware sampling to reduce data loading delays with many workers
   use_locality_sampler: true
@@ -22,12 +22,12 @@ training:
 
 scheduler:
   name: cosine
-  warmup_steps: 200
+  warmup_steps: 1000  
   min_lr: 1e-5
 
 # Fine-tuning
 optimizer:
-  lr: 0.001
+  lr: 0.0003 
   weight_decay: 0.0001
   betas: [0.9, 0.95]
 

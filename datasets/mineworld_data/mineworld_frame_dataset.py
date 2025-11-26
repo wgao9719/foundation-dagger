@@ -402,7 +402,38 @@ class MineWorldDecodedFrameDataset(Dataset):
             # REMOVED: self.video_step_infos which consumed massive memory for no reason.
             # step_infos = [{"frame_idx": int(idx)} for idx in range(num_steps)]
             # self.video_step_infos[video_id] = step_infos
+            # Filter frames where the inventory key is held down (consecutive 'inventory' actions)
+            # to prevent mode collapse where the model learns to keep pressing 'e'.
+            skip_indices = set()
+            try:
+                # Load the buttons tensor to identify inventory actions.
+                # map_location="cpu" avoids GPU usage during dataset init.
+                payload = torch.load(decoded_path, map_location="cpu")
+                buttons = payload["buttons"]
+                
+                # "inventory" is a specific discrete action index
+                inv_idx = CameraHierarchicalMapping.BUTTONS_COMBINATION_TO_IDX["inventory"]
+                
+                # Identify consecutive inventory presses:
+                # buttons[i] == inv_idx AND buttons[i-1] == inv_idx
+                is_inv = (buttons == inv_idx)
+                # Logical AND between current frame being inv and *previous* frame being inv
+                # is_inv[:-1] is 0 to N-2 (previous)
+                # is_inv[1:]  is 1 to N-1 (current)
+                is_consecutive = is_inv[:-1] & is_inv[1:]
+                
+                # The indices in 'is_consecutive' correspond to the 'current' frame (1 to N-1)
+                # torch.where returns indices where condition is true.
+                # We add 1 because index 0 in is_consecutive corresponds to index 1 in buttons.
+                skip_indices = set((torch.where(is_consecutive)[0] + 1).tolist())
+                
+            except Exception as e:
+                # If loading fails (e.g. corrupt file), log warning and proceed without filtering
+                print(f"Warning: Failed to load {decoded_path} for filtering: {e}")
+
             for end_idx in range(self.context_frames - 1, num_steps):
+                if end_idx in skip_indices:
+                    continue
                 self.samples.append((decoded_path, video_id, end_idx))
 
         if not self.samples:
