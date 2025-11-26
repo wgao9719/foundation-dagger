@@ -44,8 +44,10 @@ if str(ROOT_DIR) not in sys.path:
 
 from datasets.mineworld_data.diamond_dataset import (
     MineRLDiamondDataset,
+    MineRLDiamondDecodedDataset,
     collate_minerl_batch,
 )
+from utils.VideoGroupedSampler import VideoGroupedSampler
 from algorithms.foundation_dagger.diamond_policy import (
     MineRLPolicy,
     MineRLPolicyConfig,
@@ -175,39 +177,47 @@ def compute_accuracy(
     return accuracies
 
 
-def estimate_class_weights(
-    dataset: MineRLDiamondDataset,
-    num_samples: int = 10000,
+def estimate_class_weights_fast(
+    dataset,
+    sample_indices: List[int],
     temperature: float = 0.5,
 ) -> Dict[str, torch.Tensor]:
     """
-    Estimate class weights for rare categorical actions.
+    Fast class weight estimation using pre-loaded trajectory data.
     
-    Uses inverse frequency weighting with temperature smoothing.
+    Avoids calling dataset[idx] which triggers video decoding.
     """
     action_space = dataset.get_action_space_info()
     
-    # Sample subset for frequency estimation
-    indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
+    # Get trajectory data directly
+    traj_data = getattr(dataset, '_trajectory_data', None)
+    if traj_data is None:
+        # Fallback for original dataset
+        traj_data = dataset._trajectory_data
     
-    # Count frequencies
+    # Count from trajectory actions directly
     place_counts = Counter()
     equip_counts = Counter()
     craft_counts = Counter()
     nearby_craft_counts = Counter()
     nearby_smelt_counts = Counter()
     
-    for idx in tqdm(indices, desc="Estimating class weights", leave=False):
-        sample = dataset[idx]
-        place_counts[sample["action_place"].item()] += 1
-        equip_counts[sample["action_equip"].item()] += 1
-        craft_counts[sample["action_craft"].item()] += 1
-        nearby_craft_counts[sample["action_nearby_craft"].item()] += 1
-        nearby_smelt_counts[sample["action_nearby_smelt"].item()] += 1
+    # Sample from pre-loaded actions
+    sampled = random.sample(sample_indices, min(5000, len(sample_indices)))
+    for idx in sampled:
+        video_id, frame_idx = dataset.samples[idx]
+        actions = traj_data[video_id]["actions"]
+        place_counts[int(actions["place"][frame_idx])] += 1
+        equip_counts[int(actions["equip"][frame_idx])] += 1
+        craft_counts[int(actions["craft"][frame_idx])] += 1
+        nearby_craft_counts[int(actions["nearby_craft"][frame_idx])] += 1
+        nearby_smelt_counts[int(actions["nearby_smelt"][frame_idx])] += 1
     
     def counts_to_weights(counts: Counter, num_classes: int) -> torch.Tensor:
         total = sum(counts.values())
         weights = torch.ones(num_classes)
+        if total == 0:
+            return weights
         mean_count = total / num_classes
         for cls, count in counts.items():
             if count > 0:
@@ -234,17 +244,22 @@ def train(
     weight_decay: float = 1e-4,
     grad_clip_norm: float = 1.0,
     label_smoothing: float = 0.0,
+    train_fraction: float = 1.0,
     val_fraction: float = 0.1,
     num_workers: int = 4,
+    warmup_steps: int = 1000,
     backbone: str = "small_cnn",
     use_temporal_encoder: bool = False,
     button_weight: float = 1.0,
     camera_weight: float = 1.0,
-    categorical_weight: float = 2.0,  # Higher weight for rare actions
+    categorical_weight: float = 2.0,
     class_weight_temperature: float = 0.5,
     seed: int = 42,
     checkpoint_interval: int = 1,
     wandb_project: str = "diamond-bc",
+    use_decoded: bool = True,
+    sampler_chunk_size: int = 512,
+    prefetch_factor: int = 4,
 ) -> None:
     """Main training function."""
     
@@ -257,18 +272,27 @@ def train(
     
     # Build dataset
     print(f"Loading dataset from {data_root}...")
-    dataset = MineRLDiamondDataset(
-        data_root=data_root,
-        context_frames=context_frames,
-        n_camera_bins=n_camera_bins,
-        skip_null_actions=True,
-    )
+    if use_decoded:
+        dataset = MineRLDiamondDecodedDataset(
+            decoded_root=data_root,
+            context_frames=context_frames,
+            n_camera_bins=n_camera_bins,
+            skip_null_actions=True,
+        )
+    else:
+        dataset = MineRLDiamondDataset(
+            data_root=data_root,
+            context_frames=context_frames,
+            n_camera_bins=n_camera_bins,
+            skip_null_actions=True,
+        )
     print(f"Total samples: {len(dataset)}")
     
     # Train/val split by trajectory
     # Group samples by video_id
     video_to_indices: Dict[int, List[int]] = {}
-    for idx, (video_id, _) in enumerate(dataset.samples):
+    train_samples = dataset.samples[:int(len(dataset) * train_fraction)]
+    for idx, (video_id, _) in enumerate(train_samples):
         video_to_indices.setdefault(video_id, []).append(idx)
     
     video_ids = list(video_to_indices.keys())
@@ -293,27 +317,42 @@ def train(
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
     
-    # Estimate class weights for rare actions
+    # Estimate class weights for rare actions (fast - no video decoding)
     print("Estimating class weights for rare actions...")
-    rare_action_weights = estimate_class_weights(
+    rare_action_weights = estimate_class_weights_fast(
         dataset,
-        num_samples=min(10000, len(train_indices)),
+        sample_indices=train_indices,
         temperature=class_weight_temperature,
     )
     print("Class weights:")
     for name, weights in rare_action_weights.items():
         print(f"  {name}: {weights.tolist()}")
     
-    # Data loaders
+    # Build VideoGroupedSampler for cache-friendly loading
+    # Map train_indices to (None, video_id, subset_idx) format
+    subset_samples = [
+        (None, dataset.samples[train_indices[i]][0], i)
+        for i in range(len(train_indices))
+    ]
+    train_sampler = VideoGroupedSampler(
+        samples=subset_samples,
+        chunk_size=sampler_chunk_size,
+        seed=seed,
+        shuffle_videos=True,
+        shuffle_within_video=True,
+    )
+    print(f"Using VideoGroupedSampler with chunk_size={sampler_chunk_size}")
+    
+    # Data loaders with locality-aware sampling
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=num_workers,
         collate_fn=collate_minerl_batch,
         pin_memory=True,
         persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     
     val_loader = DataLoader(
@@ -323,6 +362,7 @@ def train(
         num_workers=max(1, num_workers // 2),
         collate_fn=collate_minerl_batch,
         pin_memory=True,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     
     # Build model
@@ -353,15 +393,21 @@ def train(
     )
     
     total_steps = len(train_loader) * epochs
-    warmup_steps = min(1000, total_steps // 10)
-    
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return (step + 1) / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1 + math.cos(math.pi * progress))
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    warmup_steps = min(warmup_steps, total_steps//10)
+
+    base_lr = optimizer.param_groups[0]["lr"]
+    min_ratio = 1e-5 / base_lr if base_lr > 0 else 0.0
+
+    def _cosine_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        if total_steps <= warmup_steps:
+            return 1.0
+        progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_cosine_lambda)
     
     # Initialize wandb
     wandb.init(
@@ -374,6 +420,7 @@ def train(
             "n_camera_bins": n_camera_bins,
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
+            "warmup_steps": warmup_steps,
             "backbone": backbone,
             "use_temporal_encoder": use_temporal_encoder,
             "button_weight": button_weight,
@@ -390,6 +437,9 @@ def train(
     best_val_loss = float("inf")
     
     for epoch in range(epochs):
+        # Update sampler epoch for reproducible shuffling
+        train_sampler.set_epoch(epoch)
+        
         # Training
         model.train()
         train_losses = []
@@ -560,8 +610,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
-    parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--train-fraction", type=float, default=1.0)
+    parser.add_argument("--val-fraction", type=float, default=0.01)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument(
         "--backbone",
         type=str,
@@ -576,6 +628,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-interval", type=int, default=1)
     parser.add_argument("--wandb-project", type=str, default="diamond-bc")
+    parser.add_argument("--use-decoded", action="store_true",
+                        help="Use pre-decoded tensor bundles from decode_diamond_frames.py")
+    parser.add_argument("--sampler-chunk-size", type=int, default=512,
+                        help="Chunk size for VideoGroupedSampler (larger = more locality)")
+    parser.add_argument("--prefetch-factor", type=int, default=4,
+                        help="DataLoader prefetch factor")
     return parser.parse_args()
 
 
@@ -592,8 +650,10 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
         label_smoothing=args.label_smoothing,
+        train_fraction=args.train_fraction,
         val_fraction=args.val_fraction,
         num_workers=args.num_workers,
+        warmup_steps=args.warmup_steps,
         backbone=args.backbone,
         use_temporal_encoder=args.use_temporal_encoder,
         button_weight=args.button_weight,
@@ -603,5 +663,8 @@ if __name__ == "__main__":
         seed=args.seed,
         checkpoint_interval=args.checkpoint_interval,
         wandb_project=args.wandb_project,
+        use_decoded=args.use_decoded,
+        sampler_chunk_size=args.sampler_chunk_size,
+        prefetch_factor=args.prefetch_factor,
     )
 

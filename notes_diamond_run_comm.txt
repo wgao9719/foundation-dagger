@@ -1,19 +1,36 @@
-python scripts/train_minerl_bc.py \
+python scripts/decode_diamond_frames.py \
     --data-root data/task_diamond \
+    --output-root data/task_diamond_decoded \
+    --num-workers 8
+
+
+
+python scripts/train_diamond_bc.py \
+    --data-root data/task_diamond_decoded \
     --epochs 50 \
     --batch-size 512 \
     --context-frames 1 \
+    --train-fraction 1.0 \
+    --val-fraction 0.01 \
     --learning-rate 0.0003 \
     --weight-decay 0.0001 \
     --grad-clip-norm 2.0 \
     --label-smoothing 0.05 \
     --num-workers 16 \
-    --backbone resnet_18 \
+    --backbone resnet18 \
     --button-weight 1.0 \
     --camera-weight 1.0 \
     --categorical-weight 2.0 \
     --class-weight-temperature 0.5 \
     --seed 0 \
     --checkpoint-interval 1 \
-    --output checkpoints/diamond_bc_1.ckpt
+    --output checkpoints/bc_diamond_1.ckpt \
+    --sampler-chunk-size 512 \
+    --prefetch-factor 4
+
+python scripts/minerl_evaluation_diamond.py \
+    --checkpoint checkpoints/diamond_bc_best.ckpt \
+    --env-id MineRLObtainDiamondShovel-v0 \
+    --episodes 5 \
+    --max-steps 3000
 

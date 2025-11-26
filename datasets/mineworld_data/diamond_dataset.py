@@ -594,6 +594,177 @@ class MineRLDiamondDataset(Dataset):
 
 
 # =============================================================================
+# Decoded Dataset (Fast Loading from Pre-decoded Tensors)
+# =============================================================================
+
+class MineRLDiamondDecodedDataset(Dataset):
+    """
+    Fast dataset for pre-decoded MineRL Diamond trajectories.
+    
+    Loads frames from .pt tensor bundles created by decode_diamond_frames.py
+    instead of decoding MP4 videos on-the-fly.
+    """
+    
+    def __init__(
+        self,
+        decoded_root: Path,
+        context_frames: int = 8,
+        n_camera_bins: int = 11,
+        skip_null_actions: bool = True,
+        max_cached_bundles: int = 8,
+    ) -> None:
+        self.decoded_root = Path(decoded_root)
+        self.context_frames = context_frames
+        self.skip_null_actions = skip_null_actions
+        self.action_mapper = MineRLActionMapping(n_camera_bins=n_camera_bins)
+        
+        # Load manifest
+        manifest_path = self.decoded_root / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Manifest not found at {manifest_path}")
+        with open(manifest_path) as f:
+            self.manifest = json.load(f)
+        
+        # Bundle cache (LRU)
+        self._bundle_cache: Dict[int, Dict] = {}
+        self._cache_order: List[int] = []
+        self._max_cached = max(1, max_cached_bundles)
+        
+        # Build index
+        self._trajectory_data: Dict[int, Dict] = {}
+        self.samples: List[Tuple[int, int]] = []
+        self._build_index()
+    
+    def _load_bundle(self, traj_id: int) -> Dict:
+        """Load a trajectory bundle with LRU caching."""
+        if traj_id in self._bundle_cache:
+            # Move to end of LRU
+            self._cache_order.remove(traj_id)
+            self._cache_order.append(traj_id)
+            return self._bundle_cache[traj_id]
+        
+        # Load from disk
+        traj_info = self.manifest["trajectories"][traj_id]
+        bundle_path = self.decoded_root / traj_info["decoded_file"]
+        bundle = torch.load(bundle_path, weights_only=False)
+        
+        # Cache
+        self._bundle_cache[traj_id] = bundle
+        self._cache_order.append(traj_id)
+        
+        # Evict if over limit
+        while len(self._cache_order) > self._max_cached:
+            old_id = self._cache_order.pop(0)
+            self._bundle_cache.pop(old_id, None)
+        
+        return bundle
+    
+    def _build_index(self) -> None:
+        """Build sample index from manifest."""
+        for traj_info in self.manifest["trajectories"]:
+            traj_id = traj_info["traj_id"]
+            bundle = self._load_bundle(traj_id)
+            
+            # Process actions
+            npz_data = {k: bundle[k] for k in bundle.get("npz_keys", []) if k in bundle}
+            if not npz_data:
+                # Fallback: find action keys
+                npz_data = {k: v for k, v in bundle.items() 
+                           if k.startswith("action$") or k.startswith("observation$")}
+            
+            actions = self.action_mapper.process_npz_actions(npz_data)
+            observations = self.action_mapper.process_npz_observations(npz_data)
+            
+            num_frames = len(bundle["frames"])
+            num_actions = len(actions["binary_buttons"])
+            usable = min(num_frames, num_actions)
+            
+            if usable < self.context_frames:
+                continue
+            
+            self._trajectory_data[traj_id] = {
+                "actions": actions,
+                "observations": observations,
+                "num_frames": usable,
+            }
+            
+            # Build samples
+            for end_idx in range(self.context_frames - 1, usable):
+                if self.skip_null_actions and self._is_null_action(actions, end_idx):
+                    continue
+                self.samples.append((traj_id, end_idx))
+        
+        # Clear cache after indexing (will reload on demand)
+        self._bundle_cache.clear()
+        self._cache_order.clear()
+        
+        print(f"MineRLDiamondDecodedDataset: {len(self.samples)} samples from "
+              f"{len(self._trajectory_data)} trajectories")
+    
+    def _is_null_action(self, actions: Dict[str, np.ndarray], idx: int) -> bool:
+        """Check if action at idx is null."""
+        if actions["binary_buttons"][idx].sum() > 0:
+            return False
+        cam = actions["camera"][idx]
+        null_bin = self.action_mapper.camera_null_bin
+        if cam[0] != null_bin or cam[1] != null_bin:
+            return False
+        for key in ["place", "equip", "craft", "nearby_craft", "nearby_smelt"]:
+            if actions[key][idx] != 0:
+                return False
+        return True
+    
+    def __len__(self) -> int:
+        return len(self.samples)
+    
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        traj_id, end_idx = self.samples[index]
+        start_idx = end_idx - self.context_frames + 1
+        
+        bundle = self._load_bundle(traj_id)
+        traj_data = self._trajectory_data[traj_id]
+        actions = traj_data["actions"]
+        observations = traj_data["observations"]
+        
+        # Get frames from bundle
+        frames = bundle["frames"][start_idx:end_idx + 1]  # [T, H, W, C]
+        
+        # Observations
+        obs_start, obs_end = start_idx, end_idx + 1
+        inventory = torch.from_numpy(observations["inventory"][obs_start:obs_end].copy())
+        equipped_type = torch.from_numpy(observations["equipped_type"][obs_start:obs_end].copy())
+        
+        # Actions
+        return {
+            "frames": frames,
+            "inventory": inventory,
+            "equipped_type": equipped_type,
+            "action_buttons": torch.from_numpy(actions["binary_buttons"][end_idx].copy()),
+            "action_camera": torch.from_numpy(actions["camera"][end_idx].copy()),
+            "action_place": torch.tensor(actions["place"][end_idx], dtype=torch.int64),
+            "action_equip": torch.tensor(actions["equip"][end_idx], dtype=torch.int64),
+            "action_craft": torch.tensor(actions["craft"][end_idx], dtype=torch.int64),
+            "action_nearby_craft": torch.tensor(actions["nearby_craft"][end_idx], dtype=torch.int64),
+            "action_nearby_smelt": torch.tensor(actions["nearby_smelt"][end_idx], dtype=torch.int64),
+            "video_id": torch.tensor(traj_id, dtype=torch.int64),
+            "frame_idx": torch.tensor(end_idx, dtype=torch.int64),
+        }
+    
+    def get_action_space_info(self) -> Dict[str, int]:
+        return self.action_mapper.get_action_space_info()
+    
+    def get_inventory_dim(self) -> int:
+        return self.action_mapper.vocab.num_inventory_items
+    
+    def get_num_equipped_types(self) -> int:
+        return self.action_mapper.vocab.num_equipped_types
+    
+    def get_trajectory_data(self) -> Dict[int, Dict]:
+        """Direct access to trajectory data for fast class weight estimation."""
+        return self._trajectory_data
+
+
+# =============================================================================
 # Convenience functions
 # =============================================================================
 
