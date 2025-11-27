@@ -193,7 +193,7 @@ class DiamondBCAgent:
         self.deterministic = deterministic
         
         # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         # Reconstruct config from checkpoint
         if "config" in checkpoint:
@@ -237,9 +237,12 @@ class DiamondBCAgent:
         self.equipped_buffer: deque = deque(maxlen=self.context_frames)
         
         # Precompute camera bin centers for action decoding
-        camera_max_angle = 180.0
-        bin_edges = np.linspace(-camera_max_angle, camera_max_angle, n_camera_bins + 1)
+        # MUST use cfg.n_camera_bins (from checkpoint), not the cmdline n_camera_bins
+        camera_max_angle = 5.0  # Must match dataset's camera_max_angle
+        actual_bins = cfg.n_camera_bins
+        bin_edges = np.linspace(-camera_max_angle, camera_max_angle, actual_bins + 1)
         self.camera_bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        self.n_camera_bins = actual_bins  # Override with actual value from checkpoint
         
         # Action space info (set via set_action_space)
         self._action_space = None
@@ -256,6 +259,7 @@ class DiamondBCAgent:
         self.frame_buffer.clear()
         self.inventory_buffer.clear()
         self.equipped_buffer.clear()
+        self._debug_step_count = 0  # Reset debug counter
 
     def _extract_inventory(self, obs: Dict[str, Any]) -> np.ndarray:
         """Extract inventory counts from observation."""
@@ -368,6 +372,30 @@ class DiamondBCAgent:
             pitch_idx = actions["camera_pitch"].item()
             yaw_idx = actions["camera_yaw"].item()
             env_action["camera"] = self._decode_camera(pitch_idx, yaw_idx)
+            # DEBUG: Print action predictions for first 100 steps
+            if hasattr(self, '_debug_step_count'):
+                self._debug_step_count += 1
+            else:
+                self._debug_step_count = 1
+            if self._debug_step_count <= 100 and hasattr(self, '_last_logits'):
+                # Camera
+                pitch_probs = self._last_logits["camera_pitch"][:, -1].exp().cpu().numpy()[0]
+                yaw_probs = self._last_logits["camera_yaw"][:, -1].exp().cpu().numpy()[0]
+                # Buttons (just show prob of 1 for each)
+                btn_names = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
+                btn_probs = []
+                for name in btn_names:
+                    p1 = self._last_logits[f"button_{name}"][:, -1].exp().cpu().numpy()[0][1]  # prob of action=1
+                    btn_probs.append(f"{name[:3]}:{p1:.2f}")
+                # Craft (show top prediction)
+                craft_probs = self._last_logits["craft"][:, -1].exp().cpu().numpy()[0]
+                craft_idx = craft_probs.argmax()
+                craft_str = f"craft:{craft_idx}({craft_probs[craft_idx]:.2f})"
+                # Print
+                pitch_str = " ".join([f"b{i}:{p:.2f}" for i, p in enumerate(pitch_probs)])
+                yaw_str = " ".join([f"b{i}:{p:.2f}" for i, p in enumerate(yaw_probs)])
+                btn_str = " ".join(btn_probs)
+                print(f"  Step {self._debug_step_count}: btns=[{btn_str}] cam_p=[{pitch_str}] cam_y=[{yaw_str}] {craft_str}")
         
         # Categorical actions - handle both string and enum formats
         categorical_map = {
@@ -423,6 +451,8 @@ class DiamondBCAgent:
         
         # Get model prediction
         with torch.no_grad():
+            # Get raw logits for debugging
+            self._last_logits = self.policy(frames, inventory_tensor, equipped_tensor)
             actions = self.policy.predict_action(
                 frames, inventory_tensor, equipped_tensor,
                 deterministic=self.deterministic,

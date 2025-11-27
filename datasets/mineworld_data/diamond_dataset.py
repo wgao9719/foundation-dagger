@@ -132,7 +132,7 @@ class MineRLActionMapping:
     def __init__(
         self,
         n_camera_bins: int = 11,
-        camera_max_angle: float = 180.0,
+        camera_max_angle: float = 5.0,  # ±5° range, ~97% of data within this
     ):
         assert n_camera_bins % 2 == 1, "n_camera_bins should be odd for symmetric binning"
         self.n_camera_bins = n_camera_bins

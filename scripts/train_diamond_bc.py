@@ -59,6 +59,26 @@ IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
 
 
+def _nll_loss_with_smoothing(
+    log_probs: torch.Tensor,
+    targets: torch.Tensor,
+    smoothing: float = 0.0,
+    weight: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """NLL loss with optional label smoothing."""
+    if smoothing > 0.0:
+        n_classes = log_probs.size(-1)
+        confidence = 1.0 - smoothing
+        smooth_val = smoothing / max(n_classes - 1, 1)
+        true_dist = torch.full_like(log_probs, smooth_val)
+        true_dist.scatter_(-1, targets.unsqueeze(-1), confidence)
+        loss = (-true_dist * log_probs).sum(dim=-1)
+        if weight is not None:
+            loss = loss * weight.gather(0, targets)
+        return loss.mean()
+    return F.nll_loss(log_probs, targets, weight=weight)
+
+
 def compute_loss(
     logits: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
@@ -66,69 +86,63 @@ def compute_loss(
     camera_weight: float = 1.0,
     categorical_weight: float = 1.0,
     label_smoothing: float = 0.0,
-    rare_action_weights: Optional[Dict[str, torch.Tensor]] = None,
+    class_weights: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Compute multi-head BC loss.
-    
-    Returns dict with individual losses and total loss.
-    """
+    """Compute multi-head BC loss with class weighting for all heads."""
     device = next(iter(logits.values())).device
     losses = {}
     
-    # Move targets to device
-    action_buttons = batch["action_buttons"].to(device)  # [B, 8]
-    action_camera = batch["action_camera"].to(device)    # [B, 2]
+    action_buttons = batch["action_buttons"].to(device)
+    action_camera = batch["action_camera"].to(device)
     
-    # Binary button losses (8 heads)
-    # Note: "fwd" is used instead of "forward" to avoid nn.Module conflict
+    def get_weight(name: str) -> Optional[torch.Tensor]:
+        if class_weights is None:
+            return None
+        w = class_weights.get(name)
+        return w.to(device) if w is not None else None
+    
+    # Binary button losses (with class weights)
     button_names = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
     button_loss = 0.0
     for i, name in enumerate(button_names):
-        log_probs = logits[f"button_{name}"][:, -1]  # [B, 2] - last timestep
-        targets = action_buttons[:, i]  # [B]
-        loss = F.nll_loss(log_probs, targets, label_smoothing=label_smoothing)
+        log_probs = logits[f"button_{name}"][:, -1]
+        targets = action_buttons[:, i]
+        weight = get_weight(f"button_{name}")
+        loss = _nll_loss_with_smoothing(log_probs, targets, label_smoothing, weight)
         losses[f"button_{name}"] = loss
         button_loss += loss
     losses["buttons_total"] = button_loss
     
-    # Camera loss (2 axes)
-    camera_pitch_probs = logits["camera_pitch"][:, -1]  # [B, n_bins]
-    camera_yaw_probs = logits["camera_yaw"][:, -1]      # [B, n_bins]
-    camera_pitch_target = action_camera[:, 0]
-    camera_yaw_target = action_camera[:, 1]
-    
-    pitch_loss = F.nll_loss(camera_pitch_probs, camera_pitch_target)
-    yaw_loss = F.nll_loss(camera_yaw_probs, camera_yaw_target)
+    # Camera loss (with class weights)
+    pitch_weight = get_weight("camera_pitch")
+    yaw_weight = get_weight("camera_yaw")
+    pitch_loss = _nll_loss_with_smoothing(
+        logits["camera_pitch"][:, -1], action_camera[:, 0], label_smoothing, pitch_weight
+    )
+    yaw_loss = _nll_loss_with_smoothing(
+        logits["camera_yaw"][:, -1], action_camera[:, 1], label_smoothing, yaw_weight
+    )
     losses["camera_pitch"] = pitch_loss
     losses["camera_yaw"] = yaw_loss
     losses["camera_total"] = pitch_loss + yaw_loss
     
-    # Categorical action losses
+    # Categorical action losses (with class weights)
     categorical_names = ["place", "equip", "craft", "nearby_craft", "nearby_smelt"]
     categorical_loss = 0.0
     for name in categorical_names:
-        log_probs = logits[name][:, -1]  # [B, num_classes]
-        targets = batch[f"action_{name}"].to(device)  # [B]
-        
-        # Apply class weighting for rare actions
-        weight = None
-        if rare_action_weights is not None and name in rare_action_weights:
-            weight = rare_action_weights[name].to(device)
-        
-        loss = F.nll_loss(log_probs, targets, weight=weight)
+        log_probs = logits[name][:, -1]
+        targets = batch[f"action_{name}"].to(device)
+        weight = get_weight(name)
+        loss = _nll_loss_with_smoothing(log_probs, targets, label_smoothing, weight)
         losses[name] = loss
         categorical_loss += loss
     losses["categorical_total"] = categorical_loss
     
-    # Total loss
-    total = (
+    losses["total"] = (
         button_weight * button_loss +
         camera_weight * losses["camera_total"] +
         categorical_weight * categorical_loss
     )
-    losses["total"] = total
-    
     return losses
 
 
@@ -181,21 +195,23 @@ def estimate_class_weights_fast(
     dataset,
     sample_indices: List[int],
     temperature: float = 0.5,
+    n_camera_bins: int = 11,
 ) -> Dict[str, torch.Tensor]:
     """
-    Fast class weight estimation using pre-loaded trajectory data.
+    Fast class weight estimation for ALL action heads.
     
-    Avoids calling dataset[idx] which triggers video decoding.
+    Includes buttons (8), camera (2), and categorical (5) heads.
     """
     action_space = dataset.get_action_space_info()
+    traj_data = getattr(dataset, '_trajectory_data', dataset._trajectory_data)
     
-    # Get trajectory data directly
-    traj_data = getattr(dataset, '_trajectory_data', None)
-    if traj_data is None:
-        # Fallback for original dataset
-        traj_data = dataset._trajectory_data
+    # Button names
+    button_names = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
     
-    # Count from trajectory actions directly
+    # Initialize counters
+    button_counts = {name: Counter() for name in button_names}
+    camera_pitch_counts = Counter()
+    camera_yaw_counts = Counter()
     place_counts = Counter()
     equip_counts = Counter()
     craft_counts = Counter()
@@ -203,10 +219,22 @@ def estimate_class_weights_fast(
     nearby_smelt_counts = Counter()
     
     # Sample from pre-loaded actions
-    sampled = random.sample(sample_indices, min(5000, len(sample_indices)))
+    sampled = random.sample(sample_indices, min(10000, len(sample_indices)))
     for idx in sampled:
         video_id, frame_idx = dataset.samples[idx]
         actions = traj_data[video_id]["actions"]
+        
+        # Buttons (binary_buttons is [T, 8])
+        buttons = actions["binary_buttons"][frame_idx]
+        for i, name in enumerate(button_names):
+            button_counts[name][int(buttons[i])] += 1
+        
+        # Camera
+        camera = actions["camera"][frame_idx]
+        camera_pitch_counts[int(camera[0])] += 1
+        camera_yaw_counts[int(camera[1])] += 1
+        
+        # Categorical
         place_counts[int(actions["place"][frame_idx])] += 1
         equip_counts[int(actions["equip"][frame_idx])] += 1
         craft_counts[int(actions["craft"][frame_idx])] += 1
@@ -221,16 +249,38 @@ def estimate_class_weights_fast(
         mean_count = total / num_classes
         for cls, count in counts.items():
             if count > 0:
-                weights[cls] = (mean_count / count) ** temperature
+                raw = (mean_count / count) ** temperature
+                # Asymmetric scaling:
+                def squash_tail(raw: float, k: float = 33.0) -> float:
+                    return raw / (1.0 + raw / k)  # 2→~2, 5→~4.3, 100→~24.8
+
+                if raw >= 1.0:
+                    weights[cls] = squash_tail(raw, k=33.0)
+                else:
+                    weights[cls] = max(0.15, 1.0 + 0.5 * math.log(raw))
+        weights = weights * (num_classes / weights.sum())
         return weights
     
-    return {
-        "place": counts_to_weights(place_counts, action_space["num_place_classes"]),
-        "equip": counts_to_weights(equip_counts, action_space["num_equip_classes"]),
-        "craft": counts_to_weights(craft_counts, action_space["num_craft_classes"]),
-        "nearby_craft": counts_to_weights(nearby_craft_counts, action_space["num_nearby_craft_classes"]),
-        "nearby_smelt": counts_to_weights(nearby_smelt_counts, action_space["num_nearby_smelt_classes"]),
-    }
+    weights = {}
+    
+    # Button weights (each is binary: 2 classes)
+    for name in button_names:
+        weights[f"button_{name}"] = counts_to_weights(button_counts[name], 2)
+    
+    # Camera weights
+    # weights["camera_pitch"] = counts_to_weights(camera_pitch_counts, n_camera_bins)
+    # weights["camera_yaw"] = counts_to_weights(camera_yaw_counts, n_camera_bins)
+    weights["camera_pitch"] = torch.ones(n_camera_bins)
+    weights["camera_yaw"] = torch.ones(n_camera_bins)
+    
+    # Categorical weights
+    weights["place"] = counts_to_weights(place_counts, action_space["num_place_classes"])
+    weights["equip"] = counts_to_weights(equip_counts, action_space["num_equip_classes"])
+    weights["craft"] = counts_to_weights(craft_counts, action_space["num_craft_classes"])
+    weights["nearby_craft"] = counts_to_weights(nearby_craft_counts, action_space["num_nearby_craft_classes"])
+    weights["nearby_smelt"] = counts_to_weights(nearby_smelt_counts, action_space["num_nearby_smelt_classes"])
+    
+    return weights
 
 
 def train(
@@ -317,16 +367,17 @@ def train(
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
     
-    # Estimate class weights for rare actions (fast - no video decoding)
-    print("Estimating class weights for rare actions...")
-    rare_action_weights = estimate_class_weights_fast(
+    # Estimate class weights for ALL action heads (fast - no video decoding)
+    print("Estimating class weights for all action heads...")
+    class_weights = estimate_class_weights_fast(
         dataset,
         sample_indices=train_indices,
         temperature=class_weight_temperature,
+        n_camera_bins=n_camera_bins,
     )
     print("Class weights:")
-    for name, weights in rare_action_weights.items():
-        print(f"  {name}: {weights.tolist()}")
+    for name, weights in sorted(class_weights.items()):
+        print(f"  {name}: {[f'{w:.2f}' for w in weights.tolist()]}")
     
     # Build VideoGroupedSampler for cache-friendly loading
     # Map train_indices to (None, video_id, subset_idx) format
@@ -444,6 +495,13 @@ def train(
         model.train()
         train_losses = []
         train_accuracies = []
+        train_samples = []  # Collect sample predictions
+        # Distribution tracking (lightweight - just counts)
+        # Model uses "fwd" instead of "forward" to avoid nn.Module.forward conflict
+        btn_names_full = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
+        train_dist = {"tgt_btn": {n: [0,0] for n in btn_names_full}, "pred_btn": {n: [0,0] for n in btn_names_full},
+                      "tgt_cam_p": [0]*n_camera_bins, "pred_cam_p": [0]*n_camera_bins,
+                      "tgt_cam_y": [0]*n_camera_bins, "pred_cam_y": [0]*n_camera_bins, "count": 0}
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [train]")
         for batch in pbar:
@@ -461,7 +519,7 @@ def train(
                 camera_weight=camera_weight,
                 categorical_weight=categorical_weight,
                 label_smoothing=label_smoothing,
-                rare_action_weights=rare_action_weights,
+                class_weights=class_weights,
             )
             
             # Backward pass
@@ -477,20 +535,62 @@ def train(
             accuracies = compute_accuracy(logits, batch)
             train_accuracies.append(accuracies)
             
+            # Accumulate distribution (up to 10000 samples)
+            if train_dist["count"] < 10000:
+                bs = min(batch["frames"].shape[0], 10000 - train_dist["count"])
+                with torch.no_grad():
+                    for i, n in enumerate(btn_names_full):
+                        for v in batch["action_buttons"][:bs, i].tolist():
+                            train_dist["tgt_btn"][n][v] += 1
+                        for v in logits[f"button_{n}"][:bs, -1].argmax(-1).cpu().tolist():
+                            train_dist["pred_btn"][n][v] += 1
+                    for v in batch["action_camera"][:bs, 0].tolist():
+                        train_dist["tgt_cam_p"][v] += 1
+                    for v in batch["action_camera"][:bs, 1].tolist():
+                        train_dist["tgt_cam_y"][v] += 1
+                    for v in logits["camera_pitch"][:bs, -1].argmax(-1).cpu().tolist():
+                        train_dist["pred_cam_p"][v] += 1
+                    for v in logits["camera_yaw"][:bs, -1].argmax(-1).cpu().tolist():
+                        train_dist["pred_cam_y"][v] += 1
+                train_dist["count"] += bs
+            
+            # Collect sample predictions (first 5)
+            if len(train_samples) < 5:
+                with torch.no_grad():
+                    btn_names = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
+                    preds = {f"btn_{n}": logits[f"button_{n}"][:, -1].argmax(-1)[0].item() for n in btn_names}
+                    preds["cam_p"] = logits["camera_pitch"][:, -1].argmax(-1)[0].item()
+                    preds["cam_y"] = logits["camera_yaw"][:, -1].argmax(-1)[0].item()
+                    preds["craft"] = logits["craft"][:, -1].argmax(-1)[0].item()
+                    
+                    tgts = {f"btn_{n}": batch["action_buttons"][0, i].item() for i, n in enumerate(btn_names)}
+                    tgts["cam_p"] = batch["action_camera"][0, 0].item()
+                    tgts["cam_y"] = batch["action_camera"][0, 1].item()
+                    tgts["craft"] = batch["action_craft"][0].item()
+                    train_samples.append((tgts, preds))
+            
+            running_loss = sum(train_losses) / len(train_losses)
             pbar.set_postfix({
                 "loss": f"{losses['total'].item():.3f}",
+                "run_loss": f"{running_loss:.3f}",
                 "btn_acc": f"{accuracies['buttons_avg']:.3f}",
                 "cam_acc": f"{accuracies['camera_avg']:.3f}",
             })
             
             if global_step % 100 == 0:
+                # Compute running averages
+                running_btn_acc = sum(a["buttons_avg"] for a in train_accuracies) / len(train_accuracies)
+                running_cam_acc = sum(a["camera_avg"] for a in train_accuracies) / len(train_accuracies)
                 wandb.log({
                     "train/loss": losses["total"].item(),
+                    "train/run_loss": running_loss,
                     "train/loss_buttons": losses["buttons_total"].item(),
                     "train/loss_camera": losses["camera_total"].item(),
                     "train/loss_categorical": losses["categorical_total"].item(),
                     "train/acc_buttons": accuracies["buttons_avg"],
                     "train/acc_camera": accuracies["camera_avg"],
+                    "train/run_acc_buttons": running_btn_acc,
+                    "train/run_acc_camera": running_cam_acc,
                     "train/lr": scheduler.get_last_lr()[0],
                     "step": global_step,
                 })
@@ -501,6 +601,10 @@ def train(
         model.eval()
         val_losses = []
         val_accuracies = []
+        val_samples = []
+        val_dist = {"tgt_btn": {n: [0,0] for n in btn_names_full}, "pred_btn": {n: [0,0] for n in btn_names_full},
+                    "tgt_cam_p": [0]*n_camera_bins, "pred_cam_p": [0]*n_camera_bins,
+                    "tgt_cam_y": [0]*n_camera_bins, "pred_cam_y": [0]*n_camera_bins, "count": 0}
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [val]", leave=False):
@@ -514,10 +618,43 @@ def train(
                     button_weight=button_weight,
                     camera_weight=camera_weight,
                     categorical_weight=categorical_weight,
+                    class_weights=class_weights,
                 )
                 
                 val_losses.append(losses["total"].item())
                 val_accuracies.append(compute_accuracy(logits, batch))
+                
+                # Accumulate distribution
+                if val_dist["count"] < 10000:
+                    bs = min(batch["frames"].shape[0], 10000 - val_dist["count"])
+                    for i, n in enumerate(btn_names_full):
+                        for v in batch["action_buttons"][:bs, i].tolist():
+                            val_dist["tgt_btn"][n][v] += 1
+                        for v in logits[f"button_{n}"][:bs, -1].argmax(-1).cpu().tolist():
+                            val_dist["pred_btn"][n][v] += 1
+                    for v in batch["action_camera"][:bs, 0].tolist():
+                        val_dist["tgt_cam_p"][v] += 1
+                    for v in batch["action_camera"][:bs, 1].tolist():
+                        val_dist["tgt_cam_y"][v] += 1
+                    for v in logits["camera_pitch"][:bs, -1].argmax(-1).cpu().tolist():
+                        val_dist["pred_cam_p"][v] += 1
+                    for v in logits["camera_yaw"][:bs, -1].argmax(-1).cpu().tolist():
+                        val_dist["pred_cam_y"][v] += 1
+                    val_dist["count"] += bs
+                
+                # Collect sample predictions (first 5)
+                if len(val_samples) < 5:
+                    btn_names = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
+                    preds = {f"btn_{n}": logits[f"button_{n}"][:, -1].argmax(-1)[0].item() for n in btn_names}
+                    preds["cam_p"] = logits["camera_pitch"][:, -1].argmax(-1)[0].item()
+                    preds["cam_y"] = logits["camera_yaw"][:, -1].argmax(-1)[0].item()
+                    preds["craft"] = logits["craft"][:, -1].argmax(-1)[0].item()
+                    
+                    tgts = {f"btn_{n}": batch["action_buttons"][0, i].item() for i, n in enumerate(btn_names)}
+                    tgts["cam_p"] = batch["action_camera"][0, 0].item()
+                    tgts["cam_y"] = batch["action_camera"][0, 1].item()
+                    tgts["craft"] = batch["action_craft"][0].item()
+                    val_samples.append((tgts, preds))
         
         # Aggregate metrics
         avg_train_loss = sum(train_losses) / len(train_losses)
@@ -535,6 +672,31 @@ def train(
         print(f"\nEpoch {epoch+1}/{epochs}:")
         print(f"  Train loss: {avg_train_loss:.4f}, buttons_acc: {avg_train_acc['buttons_avg']:.4f}, camera_acc: {avg_train_acc['camera_avg']:.4f}")
         print(f"  Val loss: {avg_val_loss:.4f}, buttons_acc: {avg_val_acc['buttons_avg']:.4f}, camera_acc: {avg_val_acc['camera_avg']:.4f}")
+        
+        # Print accumulated distributions
+        def print_dist(dist, name):
+            total = dist["count"]
+            if total == 0:
+                return
+            print(f"  {name} dist (n={total}): Buttons(tgt/pred): ", end="")
+            for n in btn_names_full:
+                t1 = dist["tgt_btn"][n][1] / total * 100
+                p1 = dist["pred_btn"][n][1] / total * 100
+                print(f"{n[:3]}:{t1:.0f}/{p1:.0f} ", end="")
+            print()
+            print(f"    CamP: ", end="")
+            for b in range(n_camera_bins):
+                tp = dist["tgt_cam_p"][b] / total * 100
+                pp = dist["pred_cam_p"][b] / total * 100
+                print(f"b{b}:{tp:.0f}/{pp:.0f} ", end="")
+            print(f" | CamY: ", end="")
+            for b in range(n_camera_bins):
+                ty = dist["tgt_cam_y"][b] / total * 100
+                py = dist["pred_cam_y"][b] / total * 100
+                print(f"b{b}:{ty:.0f}/{py:.0f} ", end="")
+            print()
+        print_dist(train_dist, "Train")
+        print_dist(val_dist, "Val")
         
         wandb.log({
             "epoch": epoch + 1,

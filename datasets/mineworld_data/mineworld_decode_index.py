@@ -25,12 +25,16 @@ class MineWorldDecodeIndex:
         data_root: Path,
         recursive: bool = True,
         probe_timeout_seconds: float = 10.0,
+        max_fraction: float = 1.0,
     ) -> None:
         self.data_root = Path(data_root)
         self.records: List[Dict[str, object]] = []
+        self.total_candidates = 0
+        self.selected_candidates = 0
         self._action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
         self._action_transformer = ActionTransformer(**ACTION_TRANSFORMER_KWARGS)
         self._probe_timeout = max(0.0, float(probe_timeout_seconds))
+        self._fraction = min(1.0, max(0.0, float(max_fraction)))
         self._build(recursive=recursive)
 
     def _env_action_to_agent_np(self, env_action: Dict[str, object]) -> Dict[str, np.ndarray]:
@@ -58,6 +62,12 @@ class MineWorldDecodeIndex:
             )
 
         video_id = 0
+        self.total_candidates = len(video_paths)
+        total_limit = self.total_candidates
+        if self._fraction > 0.0 and self._fraction < 1.0:
+            total_limit = max(1, int(total_limit * self._fraction))
+            video_paths = video_paths[:total_limit]
+        self.selected_candidates = len(video_paths)
         for video_path in video_paths:
             action_path = video_path.with_suffix(".jsonl")
             try:

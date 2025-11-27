@@ -88,8 +88,6 @@ def main():
     
     # Find trajectories
     traj_dirs = []
-    for root, dirs, files in data_root.rglob("*"):
-        pass
     for path in data_root.rglob("rendered.npz"):
         if (path.parent / "recording.mp4").exists():
             traj_dirs.append(path.parent)
