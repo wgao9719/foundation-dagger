@@ -21,7 +21,7 @@ import random
 import sys
 import math
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from collections import Counter
 
 import torch
@@ -268,10 +268,10 @@ def estimate_class_weights_fast(
         weights[f"button_{name}"] = counts_to_weights(button_counts[name], 2)
     
     # Camera weights
-    # weights["camera_pitch"] = counts_to_weights(camera_pitch_counts, n_camera_bins)
-    # weights["camera_yaw"] = counts_to_weights(camera_yaw_counts, n_camera_bins)
-    weights["camera_pitch"] = torch.ones(n_camera_bins)
-    weights["camera_yaw"] = torch.ones(n_camera_bins)
+    weights["camera_pitch"] = counts_to_weights(camera_pitch_counts, n_camera_bins)
+    weights["camera_yaw"] = counts_to_weights(camera_yaw_counts, n_camera_bins)
+    # weights["camera_pitch"] = torch.ones(n_camera_bins)
+    # weights["camera_yaw"] = torch.ones(n_camera_bins)
     
     # Categorical weights
     weights["place"] = counts_to_weights(place_counts, action_space["num_place_classes"])
@@ -310,6 +310,8 @@ def train(
     use_decoded: bool = True,
     sampler_chunk_size: int = 512,
     prefetch_factor: int = 4,
+    checkpoint_path: Optional[str] = None,
+    cifar_stem: Union[bool, str] = False,
 ) -> None:
     """Main training function."""
     
@@ -420,10 +422,33 @@ def train(
     action_space_info = dataset.get_action_space_info()
     cfg = MineRLPolicyConfig(
         backbone=backbone,
-        vision_dim=256,
+        vision_dim=256,  # Could make configurable
         n_camera_bins=n_camera_bins,
         use_temporal_encoder=use_temporal_encoder,
+        cifar_stem=cifar_stem,
     )
+    
+    # Checkpoint loading
+    start_epoch = 0
+    model_state = None
+    optimizer_state = None
+    
+    if checkpoint_path:
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model_state = checkpoint.get("model_state_dict", checkpoint)
+        optimizer_state = checkpoint.get("optimizer_state_dict")
+        if "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"]
+            print(f"Resuming from epoch {start_epoch}")
+        
+        # If loading full checkpoint with config, verify consistency
+        if "config" in checkpoint:
+            ckpt_cfg = checkpoint["config"]
+            if isinstance(ckpt_cfg, dict):
+                # Basic check - warn if major mismatch
+                if ckpt_cfg.get("n_camera_bins") != n_camera_bins:
+                    print(f"WARNING: Checkpoint n_camera_bins ({ckpt_cfg.get('n_camera_bins')}) != current ({n_camera_bins})")
     
     model = MineRLPolicy(
         cfg=cfg,
@@ -431,6 +456,12 @@ def train(
         num_inventory_items=dataset.get_inventory_dim(),
         num_equipped_types=dataset.get_num_equipped_types(),
     )
+    
+    if model_state:
+        # Allow loading partial state (e.g. if resizing vocab)
+        model.load_state_dict(model_state, strict=False)
+        print("Model weights loaded.")
+    
     model = model.to(device)
     
     num_params = sum(p.numel() for p in model.parameters())
@@ -442,6 +473,10 @@ def train(
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+    
+    if optimizer_state:
+        optimizer.load_state_dict(optimizer_state)
+        print("Optimizer state loaded.")
     
     total_steps = len(train_loader) * epochs
     warmup_steps = min(warmup_steps, total_steps//10)
@@ -459,6 +494,13 @@ def train(
         return min_ratio + (1.0 - min_ratio) * cosine
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_cosine_lambda)
+    
+    # If resuming, step scheduler to current epoch
+    if start_epoch > 0:
+        print(f"Fast-forwarding scheduler for {start_epoch} epochs...")
+        steps_to_skip = start_epoch * len(train_loader)
+        for _ in range(steps_to_skip):
+            scheduler.step()
     
     # Initialize wandb
     wandb.init(
@@ -480,14 +522,16 @@ def train(
             "train_samples": len(train_indices),
             "val_samples": len(val_indices),
             "num_params": num_params,
+            "cifar_stem": cifar_stem,
+            "resumed_from": checkpoint_path if checkpoint_path else "scratch",
         },
     )
     
     # Training loop
-    global_step = 0
+    global_step = start_epoch * len(train_loader)
     best_val_loss = float("inf")
     
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         # Update sampler epoch for reproducible shuffling
         train_sampler.set_epoch(epoch)
         
@@ -796,6 +840,11 @@ def parse_args() -> argparse.Namespace:
                         help="Chunk size for VideoGroupedSampler (larger = more locality)")
     parser.add_argument("--prefetch-factor", type=int, default=4,
                         help="DataLoader prefetch factor")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Checkpoint to resume from")
+    parser.add_argument("--cifar-stem", type=str, default="full",
+                        choices=["full", "half", False],
+                        help="CIFAR stem for ResNet backbone")
     return parser.parse_args()
 
 
@@ -828,5 +877,7 @@ if __name__ == "__main__":
         use_decoded=args.use_decoded,
         sampler_chunk_size=args.sampler_chunk_size,
         prefetch_factor=args.prefetch_factor,
+        checkpoint_path=args.checkpoint,
+        cifar_stem=args.cifar_stem,
     )
 

@@ -175,6 +175,8 @@ class DiamondBCAgent:
         context_frames: int = 8,
         n_camera_bins: int = 11,
         deterministic: bool = True,
+        temperature: float = 1.0,
+        camera_temperature: float = 1.0,
     ) -> None:
         import sys
         if str(ROOT_DIR) not in sys.path:
@@ -191,6 +193,8 @@ class DiamondBCAgent:
         self.context_frames = max(1, int(context_frames))
         self.n_camera_bins = n_camera_bins
         self.deterministic = deterministic
+        self.temperature = temperature
+        self.camera_temperature = camera_temperature
         
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
@@ -358,8 +362,8 @@ class DiamondBCAgent:
             "back": "back",
             "right": "right",
             "jump": "jump",
-            "sneak": "sneak",
-            "sprint": "sprint",
+            # "sneak": "sneak",   # Ignored - mixed keybinds in training data
+            # "sprint": "sprint", # Ignored - mixed keybinds in training data
             "attack": "attack",
         }
         
@@ -381,7 +385,8 @@ class DiamondBCAgent:
                 # Camera
                 pitch_probs = self._last_logits["camera_pitch"][:, -1].exp().cpu().numpy()[0]
                 yaw_probs = self._last_logits["camera_yaw"][:, -1].exp().cpu().numpy()[0]
-                # Buttons (just show prob of 1 for each)
+                
+                # Buttons (just show prob of 1 for each, excluding sneak/sprint)
                 btn_names = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
                 btn_probs = []
                 for name in btn_names:
@@ -435,6 +440,11 @@ class DiamondBCAgent:
                 else:
                     env_action[key] = space.sample()
         
+        # ALWAYS force sneak/sprint to 0 (mixed keybinds in training data)
+        # This MUST be outside all conditional blocks to apply every step
+        env_action["sneak"] = 0
+        env_action["sprint"] = 0
+        
         return env_action
 
     def get_action(self, obs: Dict[str, Any]) -> Dict[str, Any]:
@@ -456,6 +466,8 @@ class DiamondBCAgent:
             actions = self.policy.predict_action(
                 frames, inventory_tensor, equipped_tensor,
                 deterministic=self.deterministic,
+                temperature=self.temperature,
+                camera_temperature=self.camera_temperature,
             )
         
         # Convert to environment format
@@ -477,11 +489,9 @@ def _make_warmup_action(action_space: gym.spaces.Dict) -> Dict[str, Any]:
         else:
             action[key] = "none"
     
-    # Walk forward and sprint
+    # Walk forward (no sprint - mixed keybinds in training data)
     if "forward" in action:
         action["forward"] = 1
-    if "sprint" in action:
-        action["sprint"] = 1
     
     return action
 
@@ -508,6 +518,8 @@ def evaluate_policy(args: argparse.Namespace) -> None:
         context_frames=args.context_frames,
         n_camera_bins=args.n_camera_bins,
         deterministic=not args.stochastic,
+        temperature=args.temperature,
+        camera_temperature=args.camera_temperature,
     )
     
     # Configure agent for this environment's action space
@@ -553,8 +565,13 @@ def evaluate_policy(args: argparse.Namespace) -> None:
         # Main evaluation loop
         print(f"Episode {episode_idx + 1}: Running policy...")
         try:
+            last_action = None
             while not done and (args.max_steps is None or steps < args.max_steps):
-                action = agent.get_action(obs)
+                # Sample new action every 2 steps
+                if steps % 2 == 0 or last_action is None:
+                    last_action = agent.get_action(obs)
+                
+                action = last_action
                 obs, reward, done, info = _step_env(env, action)
                 
                 if args.render:
@@ -687,6 +704,18 @@ def parse_args() -> argparse.Namespace:
         "--stochastic",
         action="store_true",
         help="Use stochastic action sampling instead of argmax.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature for buttons/categorical in stochastic mode.",
+    )
+    parser.add_argument(
+        "--camera-temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature for camera in stochastic mode.",
     )
     parser.add_argument(
         "--warmup-steps",

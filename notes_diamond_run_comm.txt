@@ -12,7 +12,7 @@ eval "$(micromamba shell hook -s bash)"
 
 micromamba activate /workspace/mamba/envs/dagger
 
-scp -r -P 24905 -i ~/.ssh/id_ed25519 root@64.247.206.120:/workspace/foundation-dagger/foundation-dagger/outputs/diamond4 /Users/willi1/foundation-dagger/diffusion-forcing-transformer/outputs
+scp -r -P 43479 -i ~/.ssh/id_ed25519 root@216.81.245.71:/workspace/foundation-dagger/foundation-dagger/outputs/diamond9 /Users/willi1/foundation-dagger/diffusion-forcing-transformer/outputs
 
 Decoding
 python scripts/decode_diamond_frames.py \

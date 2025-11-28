@@ -10,7 +10,7 @@ Key differences from the VPT-style FoundationBCPolicy:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -105,6 +105,7 @@ class SmallCNN(nn.Module):
 class ResNetBackbone(nn.Module):
     """
     Thin wrapper around torchvision ResNet that emits pooled features.
+    Supports standard ImageNet stem (stride 32) and CIFAR stem (stride 8).
     """
     
     def __init__(
@@ -113,15 +114,31 @@ class ResNetBackbone(nn.Module):
         pretrained: bool = True,
         trainable: bool = True,
         out_dim: Optional[int] = None,
+        cifar_stem: Union[bool, str] = False,  # False, True (full), or "half"
     ) -> None:
         super().__init__()
         backbone = _resolve_resnet(name, pretrained)
         feature_dim = backbone.fc.in_features
+        
+        if cifar_stem is True or cifar_stem == "full":
+            # Full CIFAR: 3x3 stride 1 (64->64), no maxpool -> 8x8 final
+            backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            backbone.maxpool = nn.Identity()
+            nn.init.kaiming_normal_(backbone.conv1.weight, mode='fan_out', nonlinearity='relu')
+        elif cifar_stem == "half":
+            # Half CIFAR: 3x3 stride 2 (64->32), no maxpool -> 4x4 final
+            # Compromise: better resolution than original, faster than full CIFAR
+            backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1, bias=False)
+            backbone.maxpool = nn.Identity()
+            nn.init.kaiming_normal_(backbone.conv1.weight, mode='fan_out', nonlinearity='relu')
+        
         modules = list(backbone.children())[:-1]
         self.encoder = nn.Sequential(*modules)
+        
         if not trainable:
             for param in self.encoder.parameters():
                 param.requires_grad_(False)
+                
         self.feature_dim = out_dim or feature_dim
         self.project = None
         if out_dim is not None and out_dim != feature_dim:
@@ -314,6 +331,7 @@ class MineRLPolicyConfig:
     backbone: Literal["small_cnn", "resnet18", "resnet34", "resnet50"] = "small_cnn"
     pretrained_backbone: bool = True
     backbone_trainable: bool = True
+    cifar_stem: Union[bool, str] = False  # False, True/"full", or "half"
     vision_dim: int = 256  # Output dim of vision encoder
     
     # Inventory encoder
@@ -377,6 +395,7 @@ class MineRLPolicy(nn.Module):
                 pretrained=cfg.pretrained_backbone,
                 trainable=cfg.backbone_trainable,
                 out_dim=cfg.vision_dim,
+                cifar_stem=cfg.cifar_stem,
             )
         
         # Inventory encoder
@@ -472,11 +491,15 @@ class MineRLPolicy(nn.Module):
         inventory: torch.Tensor,
         equipped_type: torch.Tensor,
         deterministic: bool = True,
+        temperature: float = 1.0,
+        camera_temperature: float = 1.0,  # Separate temp for camera
     ) -> Dict[str, torch.Tensor]:
         """
         Predict actions for inference.
         
-        Returns dict with predicted action indices/values.
+        Args:
+            temperature: Sampling temperature for buttons/categorical (default 1.0)
+            camera_temperature: Sampling temperature for camera (default 1.0)
         """
         with torch.no_grad():
             logits = self.forward(frames, inventory, equipped_type)
@@ -484,6 +507,24 @@ class MineRLPolicy(nn.Module):
         # Take last timestep
         actions = {}
         
+        # Helper for sampling with temperature and confidence gating
+        def sample(logits, temp=1.0):
+            if temp != 1.0 and temp > 0:
+                logits = logits / temp
+            
+            # Confidence gating: if max prob > 0.85, use argmax
+            probs = torch.softmax(logits, dim=-1)
+            max_prob, max_idx = probs.max(dim=-1)
+            
+            # Create a mask for where we should use argmax
+            use_argmax = max_prob > 0.9
+            
+            # Sample everything first
+            sampled = torch.distributions.Categorical(logits=logits).sample()
+            
+            # Override with argmax where confident
+            return torch.where(use_argmax, max_idx, sampled)
+
         # Binary buttons (map "fwd" back to "forward" for external API)
         button_name_map = {"fwd": "forward"}  # internal -> external
         for name in self.action_head.button_names:
@@ -492,7 +533,7 @@ class MineRLPolicy(nn.Module):
             if deterministic:
                 actions[external_name] = log_probs.argmax(dim=-1)
             else:
-                actions[external_name] = torch.distributions.Categorical(logits=log_probs).sample()
+                actions[external_name] = sample(log_probs, temperature)
         
         # Camera
         if self.cfg.use_continuous_camera:
@@ -504,8 +545,9 @@ class MineRLPolicy(nn.Module):
                 actions["camera_pitch"] = pitch_probs.argmax(dim=-1)
                 actions["camera_yaw"] = yaw_probs.argmax(dim=-1)
             else:
-                actions["camera_pitch"] = torch.distributions.Categorical(logits=pitch_probs).sample()
-                actions["camera_yaw"] = torch.distributions.Categorical(logits=yaw_probs).sample()
+                # Use camera_temperature here
+                actions["camera_pitch"] = sample(pitch_probs, camera_temperature)
+                actions["camera_yaw"] = sample(yaw_probs, camera_temperature)
         
         # Categorical actions
         for name in ["place", "equip", "craft", "nearby_craft", "nearby_smelt"]:
@@ -513,7 +555,7 @@ class MineRLPolicy(nn.Module):
             if deterministic:
                 actions[name] = log_probs.argmax(dim=-1)
             else:
-                actions[name] = torch.distributions.Categorical(logits=log_probs).sample()
+                actions[name] = sample(log_probs, temperature)
         
         return actions
 
