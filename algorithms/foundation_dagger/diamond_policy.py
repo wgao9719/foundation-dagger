@@ -164,8 +164,8 @@ class InventoryEncoder(nn.Module):
         num_inventory_items: int = 18,
         num_equipped_types: int = 3,
         equipped_embed_dim: int = 16,
-        hidden_dim: int = 64,
-        out_dim: int = 64,
+        hidden_dim: int = 128,
+        out_dim: int = 128,
     ):
         super().__init__()
         self.num_inventory_items = num_inventory_items
@@ -177,12 +177,18 @@ class InventoryEncoder(nn.Module):
         # Input: inventory counts [B, T, 18] + equipped embed [B, T, 16] = 34
         input_dim = num_inventory_items + equipped_embed_dim
         
+        # LayerNorm before MLP to stabilize scale
+        self.norm = nn.LayerNorm(input_dim)
+        
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),
         )
         self.out_dim = out_dim
+        
+        # For normalizing log counts
+        self._log_max = torch.log(torch.tensor(65.0))
         
         self._init_weights()
     
@@ -208,14 +214,16 @@ class InventoryEncoder(nn.Module):
         Returns:
             [B, T, out_dim] encoded observation features
         """
-        # Log-scale inventory counts for better gradient flow
+        # Log-scale and normalize inventory counts to ~[0, 1]
         inv_float = torch.log1p(inventory.float())  # [B, T, 18]
+        inv_float = inv_float / self._log_max.to(inv_float.device)
         
         # Embed equipped type
         eq_embed = self.equipped_embed(equipped_type)  # [B, T, embed_dim]
         
-        # Concatenate and encode
+        # Concatenate, normalize, and encode
         combined = torch.cat([inv_float, eq_embed], dim=-1)  # [B, T, 34]
+        combined = self.norm(combined)
         return self.mlp(combined)  # [B, T, out_dim]
 
 
@@ -224,10 +232,15 @@ class MultiHeadActionOutput(nn.Module):
     Multi-head action output for MineRL factored action space.
     
     Produces logits for:
-    - 8 binary buttons (each 2-class)
+    - Binary buttons (each 2-class) - 3 if minimal, 8 if full
     - 2D camera (binned, or continuous)
     - 5 categorical actions (place, equip, craft, nearby_craft, nearby_smelt)
     """
+    
+    # Full button set
+    ALL_BUTTONS = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
+    # Minimal button set (remove back, left, right, sneak, sprint)
+    MINIMAL_BUTTONS = ["fwd", "jump", "attack"]
     
     def __init__(
         self,
@@ -240,10 +253,12 @@ class MultiHeadActionOutput(nn.Module):
         num_nearby_craft_classes: int = 7,
         num_nearby_smelt_classes: int = 3,
         use_continuous_camera: bool = False,
+        minimal_actions: bool = True,
     ):
         super().__init__()
         self.n_camera_bins = n_camera_bins
         self.use_continuous_camera = use_continuous_camera
+        self.minimal_actions = minimal_actions
         
         # Shared trunk
         self.trunk = nn.Sequential(
@@ -253,12 +268,8 @@ class MultiHeadActionOutput(nn.Module):
             nn.ReLU(inplace=True),
         )
         
-        # Binary button heads (8 separate 2-class heads)
-        # Note: use "fwd" instead of "forward" to avoid conflict with nn.Module.forward
-        self.button_names = [
-            "fwd", "left", "back", "right", 
-            "jump", "sneak", "sprint", "attack"
-        ]
+        # Binary button heads - only create heads for active buttons
+        self.button_names = self.MINIMAL_BUTTONS if minimal_actions else self.ALL_BUTTONS
         self.button_heads = nn.ModuleDict({
             name: nn.Linear(hidden_dim, 2) for name in self.button_names
         })
@@ -335,19 +346,24 @@ class MineRLPolicyConfig:
     vision_dim: int = 256  # Output dim of vision encoder
     
     # Inventory encoder
-    inventory_hidden_dim: int = 64
-    inventory_out_dim: int = 64
+    inventory_hidden_dim: int = 128
+    inventory_out_dim: int = 128
     
     # Action head
     action_hidden_dim: int = 256
     n_camera_bins: int = 11
     use_continuous_camera: bool = False
+    minimal_actions: bool = True  # Remove back, left, right, sneak, sprint
     
     # Architecture
     use_temporal_encoder: bool = False
     temporal_layers: int = 2
     temporal_heads: int = 4
     dropout: float = 0.1
+
+
+# Actions removed when minimal_actions=True
+REMOVED_BUTTONS = {"left", "back", "right", "sneak", "sprint"}
 
 
 class MineRLPolicy(nn.Module):
@@ -424,9 +440,11 @@ class MineRLPolicy(nn.Module):
                 num_layers=cfg.temporal_layers,
             )
         
-        # Action heads
+        # Action heads - re-inject inventory for stronger conditioning
+        # Input: [core, inv_feats] = combined_dim + inventory_out_dim
+        head_input_dim = combined_dim + cfg.inventory_out_dim
         self.action_head = MultiHeadActionOutput(
-            input_dim=combined_dim,
+            input_dim=head_input_dim,
             hidden_dim=cfg.action_hidden_dim,
             n_camera_bins=cfg.n_camera_bins,
             num_place_classes=action_space_info["num_place_classes"],
@@ -435,6 +453,7 @@ class MineRLPolicy(nn.Module):
             num_nearby_craft_classes=action_space_info["num_nearby_craft_classes"],
             num_nearby_smelt_classes=action_space_info["num_nearby_smelt_classes"],
             use_continuous_camera=cfg.use_continuous_camera,
+            minimal_actions=cfg.minimal_actions,
         )
     
     def forward(
@@ -478,10 +497,15 @@ class MineRLPolicy(nn.Module):
         
         # Optional temporal encoding
         if self.temporal_encoder is not None:
-            combined = self.temporal_encoder(combined)
+            core = self.temporal_encoder(combined)
+        else:
+            core = combined
+        
+        # Re-inject inventory before action heads for stronger conditioning
+        head_input = torch.cat([core, inv_feats], dim=-1)  # [B, T, combined_dim + inv_dim]
         
         # Action prediction
-        logits = self.action_head(combined)
+        logits = self.action_head(head_input)
         
         return logits
     
@@ -513,27 +537,37 @@ class MineRLPolicy(nn.Module):
                 logits = logits / temp
             
             # Confidence gating: if max prob > 0.85, use argmax
-            probs = torch.softmax(logits, dim=-1)
-            max_prob, max_idx = probs.max(dim=-1)
+            # probs = torch.softmax(logits, dim=-1)
+            # max_prob, max_idx = probs.max(dim=-1)
             
             # Create a mask for where we should use argmax
-            use_argmax = max_prob > 0.9
+            # use_argmax = max_prob > 0.95
             
             # Sample everything first
             sampled = torch.distributions.Categorical(logits=logits).sample()
+            return sampled
             
             # Override with argmax where confident
-            return torch.where(use_argmax, max_idx, sampled)
+            # return torch.where(use_argmax, max_idx, sampled)
 
         # Binary buttons (map "fwd" back to "forward" for external API)
         button_name_map = {"fwd": "forward"}  # internal -> external
-        for name in self.action_head.button_names:
-            log_probs = logits[f"button_{name}"][:, -1]  # [B, 2]
+        B = logits["camera_pitch"].shape[0]
+        device = logits["camera_pitch"].device
+        
+        # All possible buttons - output 0 for removed ones
+        all_buttons = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
+        for name in all_buttons:
             external_name = button_name_map.get(name, name)
-            if deterministic:
-                actions[external_name] = log_probs.argmax(dim=-1)
+            if name in self.action_head.button_names:
+                log_probs = logits[f"button_{name}"][:, -1]  # [B, 2]
+                if deterministic:
+                    actions[external_name] = log_probs.argmax(dim=-1)
+                else:
+                    actions[external_name] = sample(log_probs, temperature)
             else:
-                actions[external_name] = sample(log_probs, temperature)
+                # Removed button - always 0
+                actions[external_name] = torch.zeros(B, dtype=torch.long, device=device)
         
         # Camera
         if self.cfg.use_continuous_camera:

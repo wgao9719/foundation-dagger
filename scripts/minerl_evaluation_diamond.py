@@ -355,20 +355,20 @@ class DiamondBCAgent:
         """Convert policy actions to MineRL environment format."""
         env_action = {}
         
-        # Binary buttons
+        # Binary buttons - model returns 0 for removed buttons in minimal mode
         button_map = {
             "forward": "forward",
             "left": "left", 
             "back": "back",
             "right": "right",
             "jump": "jump",
-            # "sneak": "sneak",   # Ignored - mixed keybinds in training data
-            # "sprint": "sprint", # Ignored - mixed keybinds in training data
+            "sneak": "sneak",
+            "sprint": "sprint",
             "attack": "attack",
         }
         
         for policy_key, env_key in button_map.items():
-            if env_key in self._action_keys:
+            if env_key in self._action_keys and policy_key in actions:
                 env_action[env_key] = int(actions[policy_key].item())
         
         # Camera
@@ -386,12 +386,16 @@ class DiamondBCAgent:
                 pitch_probs = self._last_logits["camera_pitch"][:, -1].exp().cpu().numpy()[0]
                 yaw_probs = self._last_logits["camera_yaw"][:, -1].exp().cpu().numpy()[0]
                 
-                # Buttons (just show prob of 1 for each, excluding sneak/sprint)
+                # Buttons (only those that exist in the model)
                 btn_names = ["fwd", "left", "back", "right", "jump", "sneak", "sprint", "attack"]
                 btn_probs = []
                 for name in btn_names:
-                    p1 = self._last_logits[f"button_{name}"][:, -1].exp().cpu().numpy()[0][1]  # prob of action=1
-                    btn_probs.append(f"{name[:3]}:{p1:.2f}")
+                    key = f"button_{name}"
+                    if key in self._last_logits:
+                        p1 = self._last_logits[key][:, -1].exp().cpu().numpy()[0][1]  # prob of action=1
+                        btn_probs.append(f"{name[:3]}:{p1:.2f}")
+                    else:
+                        btn_probs.append(f"{name[:3]}:N/A")
                 # Craft (show top prediction)
                 craft_probs = self._last_logits["craft"][:, -1].exp().cpu().numpy()[0]
                 craft_idx = craft_probs.argmax()

@@ -1,10 +1,3 @@
-Prompt:
-
-You are a professional minecraft player, and one of the best in the world at getting diamonds. 
-You are tasked with helping this new player improve their abilities at getting diamonds. They are not that good yet,
-so you will supervise their work and tell them whether or not to try again.
-
-
 Env
 export VOL=/workspace 
 export PATH="$VOL/micromamba:$PATH"
@@ -12,20 +5,23 @@ eval "$(micromamba shell hook -s bash)"
 
 micromamba activate /workspace/mamba/envs/dagger
 
-scp -r -P 43479 -i ~/.ssh/id_ed25519 root@216.81.245.71:/workspace/foundation-dagger/foundation-dagger/outputs/diamond9 /Users/willi1/foundation-dagger/diffusion-forcing-transformer/outputs
+
+python scripts/analyze_diamond_actions.py --data-root data/task_diamond_decoded --use-decoded --n-camera-bins 5
+python scripts/analyze_diamond_actions.py --data-root data/task_diamond --raw-camera-only
+
 
 Decoding
 python scripts/decode_diamond_frames.py \
     --data-root data/task_diamond \
-    --output-root data/task_diamond_decoded \
+    --output-root data/task_diamond_decoded_nbin \
     --num-workers 8
 
 
 Training
 python scripts/train_diamond_bc.py \
-    --data-root data/task_diamond_decoded \
+    --data-root data/task_diamond_decoded_nbin \
     --use-decoded \
-    --epochs 50 \
+    --epochs 150 \
     --batch-size 512 \
     --context-frames 1 \
     --train-fraction 1.0 \
@@ -33,24 +29,26 @@ python scripts/train_diamond_bc.py \
     --learning-rate 0.0003 \
     --weight-decay 0.0001 \
     --grad-clip-norm 2.0 \
-    --label-smoothing 0.05 \
+    --label-smoothing 0.01 \
     --n-camera-bins 5 \
-    --num-workers 26 \
-    --warmup-steps 10000 \
+    --num-workers 24 \
+    --warmup-steps 12500 \
     --backbone resnet18 \
     --button-weight 1.0 \
-    --camera-weight 1.0 \
-    --categorical-weight 1.5 \
-    --class-weight-temperature 1.0 \
+    --camera-weight 1.2 \
+    --categorical-weight 1.0 \
+    --class-weight-temperature 0.4 \
     --seed 0 \
-    --checkpoint-interval 1 \
-    --output checkpoints/bc_diamond_1.ckpt \
-    --sampler-chunk-size 512 \
-    --prefetch-factor 6
+    --checkpoint-interval 2 \
+    --output checkpoints/bc_diamond_action_inven1/bc_diamond.ckpt \
+    --sampler-chunk-size 256 \
+    --prefetch-factor 6 \
+    --cifar-stem False
 
+    --checkpoint /workspace/foundation-dagger/foundation-dagger/checkpoints/bc_diamond_7/bc_diamond_epoch018.ckpt \
 
 Eval
-sudo add-apt-repository ppa:openjdk-r/ppa   
+sudo add-apt-repository ppa:openjdk-r/ppa
 sudo apt-get update
 sudo apt-get install openjdk-8-jdk
 
@@ -72,11 +70,17 @@ x11vnc -display :99 -rfbport 5900 -listen 0.0.0.0 \
   -nopw -forever -shared -xkb >/tmp/x11vnc.log 2>&1 &
 
 python scripts/minerl_evaluation_diamond.py \
-    --checkpoint /workspace/foundation-dagger/foundation-dagger/checkpoints/bc_diamond_1/bc_diamond_1_epoch006.ckpt \
+    --checkpoint /workspace/foundation-dagger/foundation-dagger/checkpoints/bc_diamond_action_inven1/bc_diamond_epoch060.ckpt \
     --env-id MineRLObtainDiamondShovel-v0 \
-    --episodes 1 \
-    --output-dir /workspace/foundation-dagger/foundation-dagger/outputs/diamond1 \
-    --max-steps 1200
+    --context-frames 1 \
+    --episodes 2 \
+    --seed 4 \
+    --output-dir /workspace/foundation-dagger/foundation-dagger/outputs/diamond10 \
+    --max-steps 12000 \
+    --warmup-steps 5 \
+    --stochastic \
+    --temperature 0.5 \
+    --camera-temperature 1.0
 
 pkill -f 'Xvfb :99' || true
 rm -f /tmp/.X99-lock
